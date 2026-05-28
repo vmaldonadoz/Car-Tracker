@@ -355,21 +355,25 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   char buf[16] = { 0 };
   memcpy(buf, payload, min((unsigned int)15, length));
-  uint16_t global_seq = (uint16_t)atoi(buf);  // ← nombre correcto
+  uint16_t global_seq = (uint16_t)atoi(buf);
 
   VehicleState* v = findOrCreateVehicle(device_id);
   if (!v) return;
 
-  if (!v->initialized || (uint16_t)(global_seq - v->last_seq) < 32000) {
-    v->last_seq = global_seq;  // ← global_seq, no received_seq
-    v->initialized = true;
-    Serial.printf("[MQTT] Global seq recibido: bus #%u → last_seq=%u\n",
-                  device_id, global_seq);
+  // Actualizar global_seq SIEMPRE (sirve para dedup en publishPacket)
+  if ((uint16_t)(global_seq - v->global_seq) < 32000) {
+    v->global_seq = global_seq;
   }
 
-  if ((uint16_t)(global_seq - v->global_seq) < 32000) {
-    v->global_seq = global_seq;  // ← global_seq, no received_seq
+  // Actualizar last_seq SOLO si nunca hemos visto este vehículo
+  // Una vez inicializado, last_seq lo maneja solo la recepción LoRa
+  if (!v->initialized) {
+    v->last_seq    = global_seq;
+    v->initialized = true;
+    Serial.printf("[MQTT] Bus #%u inicializado desde retained: last_seq=%u\n",
+                  device_id, global_seq);
   }
+  // ← NO hay else: si ya está inicializado, last_seq no se toca aquí
 }
 
 void connectMQTT() {
