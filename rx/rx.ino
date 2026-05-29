@@ -447,7 +447,7 @@ void initLoRa() {
     while (1) delay(1000);
   }
   // ─── MISMOS parámetros que el TX ────────────────────────
-  LoRa.setSpreadingFactor(8);
+  LoRa.setSpreadingFactor(9);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(6);
   LoRa.enableCrc();
