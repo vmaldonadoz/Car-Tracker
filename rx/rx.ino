@@ -672,7 +672,56 @@ void loop() {
     while (LoRa.available()) LoRa.read();
     totalErr++;
   }
+
+  static unsigned long lastHeartbeat = 0;
+
+if (millis() - lastHeartbeat > 30000) {
+
+    lastHeartbeat = millis();
+
+    publishHeartbeat();
 }
+}
+
+void publishHeartbeat() {
+
+    if (!mqtt.connected()) return;
+
+    char topic[128];
+    snprintf(topic, sizeof(topic),
+             "tracker/status/%s",
+             creds.stationId);
+
+    bool usbPresent = PMU.isVbusIn();
+    bool charging = PMU.isCharging();
+
+    uint8_t battPercent = PMU.getBatteryPercent();
+
+    char buf[256];
+
+    snprintf(buf, sizeof(buf),
+        "{"
+        "\"status\":\"online\","
+        "\"power\":\"%s\","
+        "\"charging\":%s,"
+        "\"battery_percent\":%u,"
+        "\"wifi_rssi\":%d,"
+        "\"rx\":%lu,"
+        "\"err\":%lu"
+        "}",
+        usbPresent ? "usb" : "battery",
+        charging ? "true" : "false",
+        battPercent,
+        WiFi.RSSI(),
+        totalRx,
+        totalErr);
+
+    mqtt.publish(topic, buf, true);
+
+Serial.println("[HB] Heartbeat enviado:");
+Serial.println(buf);
+}
+
 
 
 // ============================================================
@@ -850,3 +899,4 @@ void printPacket(const data_pkt_t& pkt, int rssi, float snr, bool gap) {
                 v ? v->rx_count : 0UL,
                 v ? v->gap_count : 0UL);
 }
+
