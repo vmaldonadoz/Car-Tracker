@@ -18,7 +18,7 @@
 #include <XPowersLib.h>
 
 // ─── Versión de firmware (cambiar en cada release OTA) ───────
-#define FIRMWARE_VERSION "1.0"
+#define FIRMWARE_VERSION "1.2"
 
 // ─── LoRa Pins ───────────────────────────────────────────────
 #define LORA_SCK 5
@@ -52,7 +52,7 @@
 #define OFFLINE_MAX_RECORDS 400
 
 // ─── Portal WiFi (config AP) ──────────────────────────────────
-#define CONFIG_AP_SSID_PREFIX "Config-LoRa"
+#define CONFIG_AP_SSID_PREFIX "LoRa-Config-"
 #define CONFIG_AP_PASS ""  // sin password; cambia si quieres seguridad
 
 typedef struct __attribute__((packed)) {
@@ -662,6 +662,13 @@ void loop() {
     }
   }
 
+  // ─── Heartbeat periódico (independiente de LoRa) ─────────
+  static unsigned long lastHeartbeat = 0;
+  if (millis() - lastHeartbeat > 30000) {
+    lastHeartbeat = millis();
+    publishHeartbeat();
+  }
+
   // ─── Recepción LoRa ──────────────────────────────────────
   int packetSize = LoRa.parsePacket();
   if (packetSize == 0) return;
@@ -678,12 +685,6 @@ void loop() {
     Serial.printf("[LoRa] Ignorado: type=0x%02X size=%d\n", pkt_type_peek, packetSize);
     while (LoRa.available()) LoRa.read();
     totalErr++;
-  }
-
-  static unsigned long lastHeartbeat = 0;
-  if (millis() - lastHeartbeat > 30000) {
-    lastHeartbeat = millis();
-    publishHeartbeat();
   }
 }
 
