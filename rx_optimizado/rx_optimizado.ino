@@ -45,7 +45,9 @@
 #define PKT_DATA 0x01
 #define PKT_REQ 0x02
 
-#define TOPIC_GLOBAL "tracker/global"
+#define TOPIC_GLOBAL       "tracker/global"
+#define LOCK_SETTLE_MS  200    // ms a esperar para que el broker distribuya el lock
+#define LOCK_EXPIRE_MS  5000   // ms antes de considerar el lock expirado (fallback)
 
 // ─── Cola offline ─────────────────────────────────────────────
 #define OFFLINE_DATA_FILE "/ofq.bin"
@@ -91,6 +93,16 @@ struct VehicleState {
   bool initialized;
   uint32_t rx_count;
   uint32_t gap_count;
+
+  // ── Lock distribuido (coordinación multi-RX vía MQTT) ───────
+  struct {
+    uint16_t from_seq;       // inicio del gap pedido
+    uint16_t to_seq;         // fin del gap pedido
+    char     station[32];    // stationId del RX que ganó el lock
+    uint32_t acquiredAt;     // millis() local cuando se registró
+    uint16_t burst_rxd;      // paquetes de burst ya recibidos
+    bool     valid;          // hay un lock activo?
+  } gap_lock;
 };
 VehicleState veh_states[MAX_VEHICLES];
 
@@ -144,6 +156,8 @@ void initPMU();
 void initLoRa();
 void publishHeartbeat();
 void doOTA(const String& version, const String& url);
+bool tryAcquireLock(VehicleState* v, uint16_t from_seq, uint16_t to_seq);
+void releaseLock(VehicleState* v);
 
 // ============================================================
 //  PORTAL WIFI DE CONFIGURACIÓN  (reemplaza BLE)
@@ -310,6 +324,51 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
+  // ── tracker/global/{device_id}/lock (lock distribuido) ────
+  if (topicStr.endsWith("/lock")) {
+    // Extraer device_id del penúltimo segmento
+    int lockSlash = topicStr.lastIndexOf('/');
+    int idSlash   = topicStr.lastIndexOf('/', lockSlash - 1);
+    if (idSlash < 0) return;
+    uint16_t device_id = (uint16_t)topicStr.substring(idSlash + 1, lockSlash).toInt();
+    if (device_id == 0) return;
+
+    VehicleState* v = findOrCreateVehicle(device_id);
+    if (!v) return;
+
+    if (length == 0) {
+      // Lock liberado (payload vacío con retained borra el mensaje)
+      // Solo limpiar si el lock no nos pertenece (el nuestro lo limpiamos en releaseLock)
+      if (!v->gap_lock.valid || strcmp(v->gap_lock.station, creds.stationId) != 0) {
+        v->gap_lock.valid = false;
+      }
+      Serial.printf("[LOCK] Bus #%u lock liberado\n", device_id);
+      return;
+    }
+
+    char buf[256] = {0};
+    memcpy(buf, payload, min((unsigned int)255, length));
+
+    StaticJsonDocument<256> doc;
+    if (deserializeJson(doc, buf) != DeserializationError::Ok) return;
+
+    const char* station = doc["station"];
+    uint16_t from = doc["from"].as<uint16_t>();
+    uint16_t to   = doc["to"].as<uint16_t>();
+    if (!station) return;
+
+    strlcpy(v->gap_lock.station, station, sizeof(v->gap_lock.station));
+    v->gap_lock.from_seq   = from;
+    v->gap_lock.to_seq     = to;
+    v->gap_lock.acquiredAt = millis();
+    v->gap_lock.burst_rxd  = 0;
+    v->gap_lock.valid      = true;
+
+    Serial.printf("[LOCK] Bus #%u lock -> '%s' [%u..%u]\n",
+                  device_id, station, from, to);
+    return;
+  }
+
   // ── tracker/global/{device_id} (sync de secuencia) ────────
   char* lastSlash = strrchr(topic, '/');
   if (!lastSlash) return;
@@ -354,6 +413,10 @@ void connectMQTT() {
     snprintf(subTopic, sizeof(subTopic), "%s/+", TOPIC_GLOBAL);
     mqtt.subscribe(subTopic);
     Serial.printf("[MQTT] Suscrito a %s\n", subTopic);
+
+    snprintf(subTopic, sizeof(subTopic), "%s/+/lock", TOPIC_GLOBAL);
+    mqtt.subscribe(subTopic);
+    Serial.printf("[MQTT] Suscrito a %s (lock distribuido)\n", subTopic);
 
     // OTA
     char otaTopic[96];
@@ -746,29 +809,67 @@ void handleDataPacket(const data_pkt_t& pkt, int rssi, float snr) {
   if (!v->initialized) {
     v->last_seq = pkt.seq;
     v->initialized = true;
+    v->gap_lock.valid = false;
     Serial.printf("[RX] Vehiculo #%u visto por primera vez. seq=%u\n",
                   pkt.device_id, pkt.seq);
   } else {
+
+    // ── ¿Es un paquete de burst (relleno de gap activo)? ─────────
+    if (v->gap_lock.valid) {
+      uint16_t gap_len = (uint16_t)(v->gap_lock.to_seq - v->gap_lock.from_seq + 1);
+      uint16_t offset  = (uint16_t)(pkt.seq - v->gap_lock.from_seq);
+      if (offset < gap_len) {
+        // Paquete dentro del rango del burst → publicar y rastrear
+        v->rx_count++;
+        printPacket(pkt, rssi, snr, false);
+        publishPacket(pkt, rssi, snr);
+        v->gap_lock.burst_rxd++;
+        Serial.printf("[BURST] Bus #%u seq=%u (%u/%u)\n",
+                      pkt.device_id, pkt.seq,
+                      v->gap_lock.burst_rxd, gap_len);
+        if (v->gap_lock.burst_rxd >= gap_len) {
+          // Burst completo: liberar lock (conservador)
+          if (strcmp(v->gap_lock.station, creds.stationId) == 0) {
+            releaseLock(v);
+          } else {
+            v->gap_lock.valid = false;
+            Serial.printf("[LOCK] Bus #%u burst completo (RX pasivo)\n",
+                          pkt.device_id);
+          }
+        }
+        return;
+      }
+    }
+
+    // ── Procesamiento normal de secuencia ─────────────────────────
     uint16_t expected = (uint16_t)(v->last_seq + 1);
 
     if (pkt.seq == expected) {
       v->last_seq = pkt.seq;
-    } else if ((uint16_t)(pkt.seq - v->last_seq) > 1) {
-      uint16_t from = (uint16_t)(v->last_seq + 1);
-      uint16_t to = (uint16_t)(pkt.seq - 1);
+    } else if ((uint16_t)(pkt.seq - v->last_seq) > 1 &&
+               (uint16_t)(pkt.seq - v->last_seq) < 32000) {
+      uint16_t from    = expected;
+      uint16_t to      = (uint16_t)(pkt.seq - 1);
       uint16_t missing = (uint16_t)(to - from + 1);
 
       Serial.printf("[GAP] Bus #%u: faltan seq %u..%u (%u paquetes)\n",
                     pkt.device_id, from, to, missing);
       v->gap_count++;
       hasGap = true;
+      v->last_seq = pkt.seq;  // avanzar ANTES de esperar el lock
 
-      delay(random(20, 80));
-      sendReq(pkt.device_id, from, to);
-
-      v->last_seq = pkt.seq;
+      if (!mqtt.connected()) {
+        // ── Sin MQTT: fallback → pedir siempre; datos guardados offline ──
+        delay(random(20, 80));
+        sendReq(pkt.device_id, from, to);
+      } else if (tryAcquireLock(v, from, to)) {
+        // ── Ganamos el lock: somos el único RX que pide este rango ────
+        sendReq(pkt.device_id, from, to);
+      }
+      // Si perdemos el lock: last_seq ya actualizado; el burst llegará
+      // y se procesará en el bloque de burst fill de arriba.
     } else {
-      return;
+      return;  // duplicado o paquete muy viejo
     }
   }
 
@@ -782,10 +883,10 @@ void handleDataPacket(const data_pkt_t& pkt, int rssi, float snr) {
 // ============================================================
 void sendReq(uint16_t device_id, uint16_t from_seq, uint16_t to_seq) {
   req_pkt_t req;
-  req.pkt_type = PKT_REQ;
+  req.pkt_type  = PKT_REQ;
   req.device_id = device_id;
-  req.from_seq = from_seq;
-  req.to_seq = to_seq;
+  req.from_seq  = from_seq;
+  req.to_seq    = to_seq;
 
   LoRa.beginPacket();
   LoRa.write((uint8_t*)&req, sizeof(req));
@@ -793,6 +894,72 @@ void sendReq(uint16_t device_id, uint16_t from_seq, uint16_t to_seq) {
 
   Serial.printf("[REQ->] Bus #%u: pidiendo seq %u..%u\n",
                 device_id, from_seq, to_seq);
+}
+
+// ============================================================
+//  Lock distribuido vía MQTT retained
+//  Solo UN RX pide cada rango; los demás esperan el burst.
+// ============================================================
+bool tryAcquireLock(VehicleState* v, uint16_t from_seq, uint16_t to_seq) {
+  // ── Verificar lock vigente de otro RX (no expirado) ──────────
+  if (v->gap_lock.valid &&
+      strcmp(v->gap_lock.station, creds.stationId) != 0 &&
+      (millis() - v->gap_lock.acquiredAt) < LOCK_EXPIRE_MS) {
+    Serial.printf("[LOCK] Bus #%u [%u..%u] ya tomado por '%s'\n",
+                  v->device_id, from_seq, to_seq, v->gap_lock.station);
+    return false;
+  }
+
+  // ── Publicar candidatura (retained) ──────────────────────────
+  char lockTopic[80];
+  snprintf(lockTopic, sizeof(lockTopic), "%s/%u/lock", TOPIC_GLOBAL, v->device_id);
+
+  char lockPayload[128];
+  snprintf(lockPayload, sizeof(lockPayload),
+           "{\"station\":\"%s\",\"from\":%u,\"to\":%u,\"ts\":%lu}",
+           creds.stationId, from_seq, to_seq, (unsigned long)millis());
+
+  mqtt.publish(lockTopic, (uint8_t*)lockPayload, strlen(lockPayload), true);
+
+  // ── Esperar LOCK_SETTLE_MS para que el broker distribuya ──────
+  //    (procesamos mqtt.loop() para recibir el retained de vuelta)
+  uint32_t t0 = millis();
+  while ((uint32_t)(millis() - t0) < LOCK_SETTLE_MS) {
+    mqtt.loop();
+    delay(5);
+  }
+
+  // ── Verificar si ganamos: el gap_lock debe tener nuestra station
+  if (v->gap_lock.valid &&
+      strcmp(v->gap_lock.station, creds.stationId) == 0 &&
+      v->gap_lock.from_seq == from_seq &&
+      v->gap_lock.to_seq   == to_seq) {
+    Serial.printf("[LOCK] Adquirido bus #%u [%u..%u]\n",
+                  v->device_id, from_seq, to_seq);
+    return true;
+  }
+
+  Serial.printf("[LOCK] Perdido bus #%u [%u..%u] -> ganador: '%s'\n",
+                v->device_id, from_seq, to_seq,
+                v->gap_lock.valid ? v->gap_lock.station : "?");
+  return false;
+}
+
+void releaseLock(VehicleState* v) {
+  if (!v->gap_lock.valid) return;
+  if (strcmp(v->gap_lock.station, creds.stationId) != 0) return;
+
+  char lockTopic[80];
+  snprintf(lockTopic, sizeof(lockTopic), "%s/%u/lock", TOPIC_GLOBAL, v->device_id);
+
+  // Payload vacío + retained=true → el broker borra el mensaje retenido
+  mqtt.publish(lockTopic, (uint8_t*)"", 0, true);
+  v->gap_lock.valid = false;
+
+  uint16_t gap_len = (uint16_t)(v->gap_lock.to_seq - v->gap_lock.from_seq + 1);
+  Serial.printf("[LOCK] Liberado bus #%u [%u..%u] (%u/%u burst recibidos)\n",
+                v->device_id, v->gap_lock.from_seq, v->gap_lock.to_seq,
+                v->gap_lock.burst_rxd, gap_len);
 }
 
 // ============================================================

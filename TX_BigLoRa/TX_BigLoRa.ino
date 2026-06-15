@@ -31,7 +31,7 @@
 //#define GPS_TX 12
 
 // ─── Configuración ───────────────────────────────────────────
-#define DEVICE_ID 2
+#define DEVICE_ID 3
 #define HDOP_MAX 3.0f
 #define INTERVAL_MOVING 5000UL
 #define INTERVAL_STATIC 5000UL
