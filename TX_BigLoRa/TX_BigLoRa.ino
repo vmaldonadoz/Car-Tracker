@@ -1,7 +1,6 @@
 // ============================================================
-//  TX-MiniLoRa-GPS.ino  —  v6
-//  Store-and-Forward + Watchdog HW + Hard-reset RA-02
-//
+//  TX-BigLoRa-GPS.ino  —  v7
+//  Anti-duplicado de retransmision (multiples RX)
 // ============================================================
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
@@ -42,9 +41,15 @@
 #define BURST_GAP_MS 80
 #define BUF_SIZE 600
 
-// ─── Watchdog / recuperación ─────────────────────────────────
+// ─── Watchdog / recuperación ─────────────────────────────
 #define WDT_TIMEOUT_SEC 60
-#define MAX_LORA_FAILS 5
+#define MAX_LORA_FAILS  5
+
+// ─── Anti-duplicado de burst ───────────────────────────
+// Si el mismo rango fue enviado hace menos de BURST_COOLDOWN_MS,
+// ignorar REQ repetidos de otros RX
+#define BURST_COOLDOWN_MS  8000
+#define RECENT_BURSTS      8    // cuántos rangos distintos recordar
 
 // ─── Tipos de paquete ────────────────────────────────────────
 #define PKT_DATA 0x01
@@ -72,10 +77,19 @@ typedef struct __attribute__((packed)) {
 static_assert(sizeof(data_pkt_t) == 36, "data_pkt_t size mismatch");
 static_assert(sizeof(req_pkt_t) == 7, "req_pkt_t size mismatch");
 
-// ─── Buffer circular ─────────────────────────────────────────
+// ─── Buffer circular ───────────────────────────────────
 data_pkt_t tx_buf[BUF_SIZE];
 uint16_t current_seq = 0;
-uint16_t oldest_seq = 0;
+uint16_t oldest_seq  = 0;
+
+// ─── Registro de bursts recientes (anti-duplicado) ───────────
+struct RecentBurst {
+  uint16_t      from_seq;
+  uint16_t      to_seq;
+  unsigned long sent_at;   // millis() cuando se envió
+};
+RecentBurst recentBursts[RECENT_BURSTS];
+uint8_t     recentBurstIdx = 0;
 
 
 // ─── Globals generales ───────────────────────────────────────
@@ -88,8 +102,7 @@ uint32_t burstSent = 0;
 unsigned long lastSend = 0;
 uint8_t loraFailCount = 0;
 
-// ─── Forward declarations ─────────────────────────────────────
-;
+// ─── Forward declarations ─────────────────────────────────
 void initPMU();
 void loraHardReset();
 bool loraApplyConfig();
@@ -100,7 +113,8 @@ void sendLatest();
 void listenForReq();
 void sendBurst(uint16_t from_seq, uint16_t to_seq);
 bool seqInBuffer(uint16_t seq);
-void printDebug(const data_pkt_t& p);
+bool wasRecentlyBursted(uint16_t from_seq, uint16_t to_seq);
+void registerBurst(uint16_t from_seq, uint16_t to_seq);
 void addDays(int& year, int& month, int& day, int n);
 void gpsToISO_VET(int year, int month, int day,
                   int hour, int minute, int second, char* out);
@@ -170,6 +184,8 @@ void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
   delay(300);
+
+  memset(recentBursts, 0, sizeof(recentBursts));
 
   initPMU();   // sube rails de LoRa y GPS
   delay(500);  // deja estabilizar
@@ -304,6 +320,8 @@ void sendLatest() {
 
 
 // ============================================================
+//  Escucha REQ con anti-duplicado
+// ============================================================
 void listenForReq() {
   LoRa.receive();
   unsigned long t0 = millis();
@@ -323,18 +341,56 @@ void listenForReq() {
     LoRa.readBytes((uint8_t*)&req, sizeof(req));
     if (req.pkt_type != PKT_REQ || req.device_id != DEVICE_ID) continue;
 
+    // ── Anti-duplicado ───────────────────────────────────────
+    if (wasRecentlyBursted(req.from_seq, req.to_seq)) {
+      Serial.printf("[REQ] Ignorado (burst reciente) seq %u..%u\n",
+                    req.from_seq, req.to_seq);
+      continue;  // no retransmitir
+    }
+    // ─────────────────────────────────────────────────
+
     char msg[60];
     snprintf(msg, sizeof(msg), "[REQ] seq %u..%u (%u faltantes)",
              req.from_seq, req.to_seq,
              (uint16_t)(req.to_seq - req.from_seq + 1));
     Serial.println(msg);
 
+    // Registrar ANTES de enviar para bloquear REQ concurrentes
+    // que puedan llegar durante el burst
+    registerBurst(req.from_seq, req.to_seq);
+
     LoRa.idle();
     sendBurst(req.from_seq, req.to_seq);
     LoRa.receive();
-    t0 = millis();
+    t0 = millis();  // extender ventana por si hay mas REQ de otros rangos
   }
   LoRa.idle();
+}
+
+
+// ============================================================
+//  Anti-duplicado de burst
+// ============================================================
+
+// Devuelve true si el rango (from_seq..to_seq) se solapa con
+// algun burst enviado hace menos de BURST_COOLDOWN_MS.
+bool wasRecentlyBursted(uint16_t from_seq, uint16_t to_seq) {
+  unsigned long now = millis();
+  for (int i = 0; i < RECENT_BURSTS; i++) {
+    if (recentBursts[i].sent_at == 0) continue;
+    if (now - recentBursts[i].sent_at > BURST_COOLDOWN_MS) continue;
+    if (from_seq <= recentBursts[i].to_seq &&
+        to_seq   >= recentBursts[i].from_seq) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Registra un burst recien enviado en el buffer circular
+void registerBurst(uint16_t from_seq, uint16_t to_seq) {
+  recentBursts[recentBurstIdx] = { from_seq, to_seq, millis() };
+  recentBurstIdx = (recentBurstIdx + 1) % RECENT_BURSTS;
 }
 
 
