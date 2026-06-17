@@ -1,5 +1,5 @@
 // ============================================================
-//  TX-MiniLoRa-GPS.ino  —  v6
+//  TX-MiniLoRa-GPS.ino  —  v8
 //  Store-and-Forward + Watchdog HW + Hard-reset RA-02 + BLE UART
 //
 //  BLE: implementa Nordic UART Service (NUS)
@@ -23,6 +23,8 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <Preferences.h>
+#include <LittleFS.h>
 
 // ─── LoRa Pins ───────────────────────────────────────────────
 #define LORA_SCK   4
@@ -47,7 +49,9 @@
 // ─── Protocolo ───────────────────────────────────────────────
 #define LISTEN_WINDOW_MS  1200
 #define BURST_GAP_MS      80
-#define BUF_SIZE          600
+#define BUF_SIZE          2400     // ventana RAM: últimos N paquetes (~84 KB, ~3.3 h)
+#define FS_BUF_SIZE       29000   // capacidad flash (~1 MB, ajustar según partición)
+#define FS_BUF_FILE       "/buf.bin"
 
 // ─── Watchdog / recuperación ─────────────────────────────────
 #define WDT_TIMEOUT_SEC   60
@@ -85,10 +89,103 @@ typedef struct __attribute__((packed)) {
 static_assert(sizeof(data_pkt_t) == 36, "data_pkt_t size mismatch");
 static_assert(sizeof(req_pkt_t)  ==  7, "req_pkt_t size mismatch");
 
-// ─── Buffer circular ─────────────────────────────────────────
-data_pkt_t tx_buf[BUF_SIZE];
+// ─── Buffer circular (RAM) ───────────────────────────────────
+data_pkt_t tx_buf[BUF_SIZE];   // ventana deslizante de los últimos BUF_SIZE paquetes
 uint16_t   current_seq = 0;
 uint16_t   oldest_seq  = 0;
+
+// ─── NVS: persistencia de secuencia ──────────────────────────
+Preferences prefs;
+
+void seqLoad() {
+  prefs.begin("tracker", true);
+  current_seq = prefs.getUShort("seq", 0);
+  oldest_seq  = prefs.getUShort("oseq", 0);
+  prefs.end();
+  Serial.printf("[NVS] seq cargado: current=%u oldest=%u\n", current_seq, oldest_seq);
+}
+
+void seqSave() {
+  prefs.begin("tracker", false);
+  prefs.putUShort("seq",  current_seq);
+  prefs.putUShort("oseq", oldest_seq);
+  prefs.end();
+}
+
+// ─── LittleFS: buffer en flash ───────────────────────────────
+//  Layout: registro i ocupa offset = (seq % FS_BUF_SIZE) * sizeof(data_pkt_t)
+//  El archivo crece 36 bytes por cada punto GPS — sin pre-creación en el arranque.
+//  Si LittleFS no está disponible, fs_ok=false y todas las ops son no-op.
+
+bool fs_ok = false;   // LittleFS montado correctamente
+
+bool fsWrite(const data_pkt_t& p) {
+  if (!fs_ok) return false;
+  uint32_t offset = (uint32_t)(p.seq % FS_BUF_SIZE) * sizeof(data_pkt_t);
+
+  // "w+" crea el archivo si no existe; "r+" reutiliza y puede extenderlo
+  const char* mode = LittleFS.exists(FS_BUF_FILE) ? "r+" : "w+";
+  File f = LittleFS.open(FS_BUF_FILE, mode);
+  if (!f) return false;
+  f.seek(offset);
+  f.write((uint8_t*)&p, sizeof(data_pkt_t));
+  f.close();
+  return true;
+}
+
+bool fsRead(uint16_t seq, data_pkt_t& out) {
+  if (!fs_ok) return false;
+  uint32_t offset = (uint32_t)(seq % FS_BUF_SIZE) * sizeof(data_pkt_t);
+  File f = LittleFS.open(FS_BUF_FILE, "r");
+  if (!f) return false;
+  // Verificar que el offset ya fue escrito (el archivo puede estar incompleto al inicio)
+  if (f.size() < offset + sizeof(data_pkt_t)) { f.close(); return false; }
+  f.seek(offset);
+  bool ok = (f.read((uint8_t*)&out, sizeof(data_pkt_t)) == sizeof(data_pkt_t));
+  f.close();
+  return ok && (out.seq == seq) && (out.pkt_type == PKT_DATA);
+}
+
+void fsInit() {
+  // true = formatear si la partición no está inicializada (solo en primer arranque)
+  // IMPORTANTE: requiere "8M with spiffs" o similar en Tools → Partition Scheme
+  if (!LittleFS.begin(true)) {
+    bleNotify("[FS] LittleFS no disponible — verifica Partition Scheme");
+    bleNotify("[FS] El sistema funciona sin persistencia en flash");
+    return;   // no fatal: el dispositivo sigue enviando normalmente
+  }
+
+  fs_ok = true;   // LittleFS listo — el archivo crece con cada paquete GPS
+
+  if (LittleFS.exists(FS_BUF_FILE)) {
+    File tmp = LittleFS.open(FS_BUF_FILE, "r");
+    char msg[50];
+    snprintf(msg, sizeof(msg), "[FS] Buffer existente (%u KB / %u pkts)",
+             (uint32_t)tmp.size() / 1024, (uint32_t)(tmp.size() / sizeof(data_pkt_t)));
+    tmp.close();
+    bleNotify(msg);
+  } else {
+    bleNotify("[FS] Buffer vacio — se llenara con datos GPS");
+  }
+
+  // Restaurar la ventana RAM con los últimos BUF_SIZE paquetes del historial
+  if (current_seq > 0) {
+    uint16_t restore_from = (uint16_t)(current_seq - oldest_seq) > BUF_SIZE
+                            ? (uint16_t)(current_seq - BUF_SIZE)
+                            : oldest_seq;
+    uint16_t restored = 0;
+    for (uint16_t s = restore_from; s != current_seq; s++) {
+      data_pkt_t tmp;
+      if (fsRead(s, tmp)) {
+        tx_buf[s % BUF_SIZE] = tmp;
+        restored++;
+      }
+    }
+    char msg[50];
+    snprintf(msg, sizeof(msg), "[FS] %u paquetes restaurados en RAM", restored);
+    bleNotify(msg);
+  }
+}
 
 // ─── BLE globals ─────────────────────────────────────────────
 BLEServer*         bleServer   = nullptr;
@@ -115,6 +212,7 @@ void  sendLatest();
 void  listenForReq();
 void  sendBurst(uint16_t from_seq, uint16_t to_seq);
 bool  seqInBuffer(uint16_t seq);
+bool  seqInFlash(uint16_t seq);
 void  printDebug(const data_pkt_t& p);
 void  addDays(int& year, int& month, int& day, int n);
 void  gpsToISO_VET(int year, int month, int day,
@@ -203,7 +301,7 @@ bool loraApplyConfig() {
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
   if (!LoRa.begin(LORA_FREQ)) return false;
-  LoRa.setSpreadingFactor(9);
+  LoRa.setSpreadingFactor(12);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(6);
   LoRa.setTxPower(20);
@@ -239,6 +337,12 @@ void setup() {
   delay(200);
   Serial.printf("\n[TX] ID=%u  BUF=%u pts (~%lu min)\n",
                 DEVICE_ID, BUF_SIZE, (unsigned long)(BUF_SIZE * 5 / 60));
+
+  // ── Recuperar secuencia desde NVS ────────────────────────────
+  seqLoad();
+
+  // ── Montar LittleFS y restaurar buffer ───────────────────────
+  fsInit();
 
   // ── BLE primero: así ya podemos notificar el estado del boot ──
   bleSetup();
@@ -332,7 +436,10 @@ bool buildAndBuffer() {
   if (moving) p.flags |= 0x04;
 
   current_seq++;
-  if ((uint16_t)(current_seq - oldest_seq) > BUF_SIZE) oldest_seq++;
+  // oldest_seq avanza cuando el buffer de FLASH está lleno (no el de RAM)
+  if ((uint16_t)(current_seq - oldest_seq) > FS_BUF_SIZE) oldest_seq++;
+  seqSave();      // persiste contadores en NVS
+  fsWrite(p);     // persiste paquete en LittleFS (36 bytes)
 
   return true;
 }
@@ -411,11 +518,23 @@ void sendBurst(uint16_t from_seq, uint16_t to_seq) {
   for (uint16_t s = from_seq; s != (uint16_t)(to_seq + 1); s++) {
     esp_task_wdt_reset();
 
-    if (!seqInBuffer(s)) { skipped++; continue; }
-    const data_pkt_t& p = tx_buf[s % BUF_SIZE];
-    if (p.seq != s) { skipped++; continue; }
+    data_pkt_t tmp;
+    const data_pkt_t* pkt = nullptr;
 
-    if (loraSendPacket((uint8_t*)&p, sizeof(data_pkt_t))) {
+    if (seqInBuffer(s)) {
+      // ── Caso 1: está en la ventana RAM ───────────────────────
+      const data_pkt_t& ramPkt = tx_buf[s % BUF_SIZE];
+      if (ramPkt.seq == s) pkt = &ramPkt;
+    }
+
+    if (!pkt && seqInFlash(s)) {
+      // ── Caso 2: fuera de RAM, buscar en LittleFS ──────────────
+      if (fsRead(s, tmp)) pkt = &tmp;
+    }
+
+    if (!pkt) { skipped++; continue; }
+
+    if (loraSendPacket((uint8_t*)pkt, sizeof(data_pkt_t))) {
       sent++;
       burstSent++;
       loraFailCount = 0;
@@ -430,15 +549,23 @@ void sendBurst(uint16_t from_seq, uint16_t to_seq) {
     delay(BURST_GAP_MS);
   }
 
-  char msg[50];
+  char msg[60];
   snprintf(msg, sizeof(msg), "[BURST] %u enviados %u omitidos", sent, skipped);
   bleNotify(msg);
 }
 
 
 // ============================================================
+//  seqInBuffer: el paquete está en la ventana RAM
 bool seqInBuffer(uint16_t seq) {
-  return (uint16_t)(current_seq - seq) <= BUF_SIZE;
+  return (uint16_t)(current_seq - seq) <= BUF_SIZE &&
+         (uint16_t)(current_seq - seq) >= 1;
+}
+
+//  seqInFlash: el paquete puede estar en LittleFS
+bool seqInFlash(uint16_t seq) {
+  return (uint16_t)(current_seq - seq) <= FS_BUF_SIZE &&
+         (uint16_t)(current_seq - seq) >= 1;
 }
 
 void printDebug(const data_pkt_t& p) {
