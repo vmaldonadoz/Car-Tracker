@@ -117,6 +117,9 @@ void seqSave() {
 //  El archivo crece 36 bytes por cada punto GPS — sin pre-creación en el arranque.
 //  Si LittleFS no está disponible, fs_ok=false y todas las ops son no-op.
 
+// Forward declaration: bleNotify se define más abajo, pero fsInit() la necesita
+void bleNotify(const char* msg);
+
 bool fs_ok = false;   // LittleFS montado correctamente
 
 bool fsWrite(const data_pkt_t& p) {
@@ -147,21 +150,21 @@ bool fsRead(uint16_t seq, data_pkt_t& out) {
 }
 
 void fsInit() {
-  // true = formatear si la partición no está inicializada (solo en primer arranque)
-  // IMPORTANTE: requiere "8M with spiffs" o similar en Tools → Partition Scheme
+  // true = formatear automáticamente en el primer arranque
+  // Requiere partition scheme con SPIFFS — "default_8MB" en ESP32-C3 lo incluye ✓
   if (!LittleFS.begin(true)) {
-    bleNotify("[FS] LittleFS no disponible — verifica Partition Scheme");
-    bleNotify("[FS] El sistema funciona sin persistencia en flash");
-    return;   // no fatal: el dispositivo sigue enviando normalmente
+    bleNotify("[FS] LittleFS no disponible — fallo al montar");
+    return;
   }
 
   fs_ok = true;   // LittleFS listo — el archivo crece con cada paquete GPS
 
   if (LittleFS.exists(FS_BUF_FILE)) {
     File tmp = LittleFS.open(FS_BUF_FILE, "r");
-    char msg[50];
+    char msg[60];
     snprintf(msg, sizeof(msg), "[FS] Buffer existente (%u KB / %u pkts)",
-             (uint32_t)tmp.size() / 1024, (uint32_t)(tmp.size() / sizeof(data_pkt_t)));
+             (uint32_t)tmp.size() / 1024,
+             (uint32_t)(tmp.size() / sizeof(data_pkt_t)));
     tmp.close();
     bleNotify(msg);
   } else {
@@ -341,11 +344,11 @@ void setup() {
   // ── Recuperar secuencia desde NVS ────────────────────────────
   seqLoad();
 
-  // ── Montar LittleFS y restaurar buffer ───────────────────────
-  fsInit();
-
-  // ── BLE primero: así ya podemos notificar el estado del boot ──
+  // ── BLE: inicializar PRIMERO para poder notificar el estado del boot ───────────
   bleSetup();
+
+  // ── LittleFS: después de BLE para que los mensajes lleguen al teléfono ───────
+  fsInit();
 
   // ── Watchdog de hardware ─────────────────────────────────────
   esp_task_wdt_deinit();

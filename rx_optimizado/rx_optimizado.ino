@@ -19,7 +19,7 @@
 #include <XPowersLib.h>
 
 // ─── Version de firmware ─────────────────────────────────────
-#define FIRMWARE_VERSION "1.4"
+#define FIRMWARE_VERSION "1.5"
 
 // ─── Seguridad MQTT ──────────────────────────────────────────
 // MQTT_USE_TLS=1: cifra la conexion TCP al broker (necesita TLS en el broker).
@@ -156,6 +156,32 @@ unsigned long lastMqttRetry    = 0;
 uint32_t totalRx  = 0;
 uint32_t totalPub = 0;
 uint32_t totalErr = 0;
+
+// ─── Contadores de error por razon ───────────────────────────
+// Permite diagnosticar exactamente que esta fallando
+enum ErrReason {
+  ERR_LORA_BAD_SIZE   = 0,   // paquete LoRa con tamano incorrecto
+  ERR_LORA_BAD_TYPE   = 1,   // tipo de paquete desconocido
+  ERR_BAD_DEVICE_ID   = 2,   // device_id == 0 o > 9999
+  ERR_BAD_LAT         = 3,   // latitud fuera de rango
+  ERR_BAD_LON         = 4,   // longitud fuera de rango
+  ERR_BAD_TIMESTAMP   = 5,   // timestamp vacio
+  ERR_MQTT_PUBLISH    = 6,   // mqtt.publish() fallo
+  ERR_MQTT_CONNECT    = 7,   // no se pudo conectar al broker
+  ERR_REASON_COUNT    = 8
+};
+const char* ERR_NAMES[ERR_REASON_COUNT] = {
+  "lora_bad_size", "lora_bad_type",
+  "bad_device_id", "bad_lat", "bad_lon", "bad_timestamp",
+  "mqtt_publish",  "mqtt_connect"
+};
+uint32_t errCount[ERR_REASON_COUNT] = { 0 };
+
+void countErr(ErrReason r) {
+  totalErr++;
+  errCount[r]++;
+  Serial.printf("[ERR] %s (total_err=%lu)\n", ERR_NAMES[r], totalErr);
+}
 
 // ─── OTA topics ──────────────────────────────────────────────
 #define OTA_TOPIC_PREFIX  "tracker/cmd/"
@@ -505,6 +531,7 @@ void connectMQTT() {
     Serial.println("[SEC] Advertencia: MQTT sin autenticacion de usuario");
   }
 
+  mqtt.setSocketTimeout(5);
   if (mqtt.connect(clientId.c_str(), mqttUser, mqttPass, lwtTopic, 1, true, "offline")) {
     mqtt.publish(lwtTopic, "online", true);
     Serial.printf("[MQTT] Conectado como '%s'\n", clientId.c_str());
@@ -528,8 +555,15 @@ void connectMQTT() {
     Serial.printf("[MQTT] Suscrito a %s, %s, %s\n", sub1, sub2, otaTopic);
     Serial.printf("[MQTT] Firmware v%s\n", FIRMWARE_VERSION);
   } else {
-    Serial.printf("[MQTT] Fallo rc=%d\n", mqtt.state());
-    totalErr++;
+    // rc codes: -4=TIMEOUT -3=LOST -2=FAILED -1=DISCONNECTED 1=BAD_PROTO
+    //            2=BAD_CLIENTID 3=UNAVAILABLE 4=BAD_CREDS 5=UNAUTHORIZED
+    Serial.printf("[MQTT] Fallo rc=%d (%s)\n", mqtt.state(),
+      mqtt.state() == -4 ? "TIMEOUT" :
+      mqtt.state() == -3 ? "LOST" :
+      mqtt.state() == -2 ? "FAILED" :
+      mqtt.state() ==  4 ? "BAD_CREDS" :
+      mqtt.state() ==  5 ? "UNAUTHORIZED" : "otro");
+    countErr(ERR_MQTT_CONNECT);
   }
 }
 
@@ -637,7 +671,7 @@ void initLoRa() {
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(6);
   LoRa.enableCrc();
-  Serial.println("[LoRa] Receptor listo (SF9 BW125 CR4/6)");
+  Serial.println("[LoRa] Receptor listo (SF12 BW125 CR4/6)");
 }
 
 
@@ -817,9 +851,21 @@ void loop() {
     LoRa.readBytes((uint8_t*)&pkt, sizeof(pkt));
     handleDataPacket(pkt, LoRa.packetRssi(), LoRa.packetSnr());
   } else {
-    Serial.printf("[LoRa] Ignorado: type=0x%02X size=%d\n", pkt_type_peek, packetSize);
+    // Log detallado para diagnostico
+    if (pkt_type_peek == PKT_DATA && packetSize != (int)sizeof(data_pkt_t)) {
+      Serial.printf("[LoRa] BAD SIZE: type=PKT_DATA esperado=%d recibido=%d RSSI=%d\n",
+                    (int)sizeof(data_pkt_t), packetSize, LoRa.packetRssi());
+      countErr(ERR_LORA_BAD_SIZE);
+    } else if (pkt_type_peek == PKT_REQ && packetSize == sizeof(req_pkt_t)) {
+      // Es un REQ que llego al RX (rebote) — descartar silenciosamente
+      Serial.printf("[LoRa] REQ propio recibido (rebote), descartando\n");
+      // No contar como error
+    } else {
+      Serial.printf("[LoRa] TIPO DESCONOCIDO: type=0x%02X size=%d RSSI=%d\n",
+                    pkt_type_peek, packetSize, LoRa.packetRssi());
+      countErr(ERR_LORA_BAD_TYPE);
+    }
     while (LoRa.available()) LoRa.read();
-    totalErr++;
   }
 }
 
@@ -829,17 +875,28 @@ void publishHeartbeat() {
   char topic[128];
   snprintf(topic, sizeof(topic), "tracker/status/%s", creds.stationId);
 
-  char buf[256];
+  // Construir detalle de errores por razon
+  char errDetail[220];
+  int pos = 0;
+  pos += snprintf(errDetail + pos, sizeof(errDetail) - pos, ",\"err_detail\":{" );
+  for (int i = 0; i < ERR_REASON_COUNT; i++) {
+    pos += snprintf(errDetail + pos, sizeof(errDetail) - pos,
+                    "\"%s\":%lu%s", ERR_NAMES[i], errCount[i],
+                    i < ERR_REASON_COUNT - 1 ? "," : "");
+  }
+  pos += snprintf(errDetail + pos, sizeof(errDetail) - pos, "}");
+
+  char buf[512];
   snprintf(buf, sizeof(buf),
       "{\"status\":\"online\",\"firmware\":\"%s\","
       "\"power\":\"%s\",\"charging\":%s,\"battery_percent\":%u,"
-      "\"wifi_rssi\":%d,\"rx\":%lu,\"err\":%lu}",
+      "\"wifi_rssi\":%d,\"rx\":%lu,\"pub\":%lu,\"err\":%lu%s}",
       FIRMWARE_VERSION,
       PMU.isVbusIn() ? "usb" : "battery",
       PMU.isCharging() ? "true" : "false",
       PMU.getBatteryPercent(),
       WiFi.RSSI(),
-      totalRx, totalErr);
+      totalRx, totalPub, totalErr, errDetail);
 
   mqtt.publish(topic, buf, true);
   Serial.printf("[HB] %s\n", buf);
@@ -852,10 +909,26 @@ void publishHeartbeat() {
 void handleDataPacket(const data_pkt_t& pkt, int rssi, float snr) {
   totalRx++;
 
-  if (pkt.device_id == 0 || pkt.device_id > 9999) { totalErr++; return; }
-  if (pkt.lat < -900000000  || pkt.lat > 900000000)  { totalErr++; return; }
-  if (pkt.lon < -1800000000 || pkt.lon > 1800000000) { totalErr++; return; }
-  if (pkt.timestamp[0] == '\0') { totalErr++; return; }
+  if (pkt.device_id == 0 || pkt.device_id > 9999) {
+    countErr(ERR_BAD_DEVICE_ID);
+    Serial.printf("[ERR] device_id invalido: %u\n", pkt.device_id);
+    return;
+  }
+  if (pkt.lat < -900000000 || pkt.lat > 900000000) {
+    countErr(ERR_BAD_LAT);
+    Serial.printf("[ERR] lat fuera de rango: %ld\n", (long)pkt.lat);
+    return;
+  }
+  if (pkt.lon < -1800000000 || pkt.lon > 1800000000) {
+    countErr(ERR_BAD_LON);
+    Serial.printf("[ERR] lon fuera de rango: %ld\n", (long)pkt.lon);
+    return;
+  }
+  if (pkt.timestamp[0] == '\0') {
+    countErr(ERR_BAD_TIMESTAMP);
+    Serial.println("[ERR] timestamp vacio");
+    return;
+  }
 
   VehicleState* v = findOrCreateVehicle(pkt.device_id);
   if (!v) { Serial.println("[RX] MAX_VEHICLES alcanzado"); return; }
@@ -983,7 +1056,7 @@ void publishPacket(const data_pkt_t& pkt, int rssi, float snr) {
     mqtt.publish(globalTopic, seqStr, true);
     Serial.printf("[MQTT] -> %s seq=%u\n", topic, pkt.seq);
   } else {
-    totalErr++;
+    countErr(ERR_MQTT_PUBLISH);
     saveOffline(pkt, rssi, snr);
   }
 }
