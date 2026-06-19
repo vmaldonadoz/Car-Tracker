@@ -39,9 +39,9 @@
 #define INTERVAL_STATIC 5000UL
 #define SPEED_THRESHOLD 2.0f
 
-// ─── Protocolo ───────────────────────────────────────────
-#define LISTEN_WINDOW_MS 1200
-#define BURST_GAP_MS 80
+// ─── Protocolo ───────────────────────────────────────
+#define LISTEN_WINDOW_MS 3000   // SF12 ToA ~2.8s: margen para REQ ida/vuelta
+#define BURST_GAP_MS     100    // pausa entre paquetes del burst (ms)
 #define BUF_SIZE     2400     // ventana RAM: últimos N paquetes (~84 KB, ~3.3 h)
 #define FS_BUF_SIZE  29000    // capacidad flash (~1 MB, ajustar según partición)
 #define FS_BUF_FILE  "/buf.bin"
@@ -50,11 +50,12 @@
 #define WDT_TIMEOUT_SEC 60
 #define MAX_LORA_FAILS  5
 
-// ─── Anti-duplicado de burst ───────────────────────────
-// Si el mismo rango fue enviado hace menos de BURST_COOLDOWN_MS,
-// ignorar REQ repetidos de otros RX
-#define BURST_COOLDOWN_MS  8000
-#define RECENT_BURSTS      8    // cuántos rangos distintos recordar
+// ─── Anti-duplicado de burst ─────────────────────────────
+// Cooldown DINAMICO: ~3s por paquete del burst (SF12) + 30s de margen.
+// Evita re-enviar burst mientras el primero todavia esta en el aire.
+#define BURST_COOLDOWN_PER_PKT  3000UL  // ms por paquete faltante
+#define BURST_COOLDOWN_MIN      30000UL // minimo 30 segundos
+#define RECENT_BURSTS           8       // cuántos rangos distintos recordar
 
 // ─── Tipos de paquete ────────────────────────────────────────
 #define PKT_DATA 0x01
@@ -177,11 +178,13 @@ void fsInit() {
   }
 }
 
-// ─── Registro de bursts recientes (anti-duplicado) ───────────
+// ─── Registro de bursts recientes (anti-duplicado) ─────────────────
+// cooldown_ms es dinamico: se calcula en listenForReq() segun los paquetes faltantes
 struct RecentBurst {
   uint16_t      from_seq;
   uint16_t      to_seq;
-  unsigned long sent_at;   // millis() cuando se envió
+  unsigned long sent_at;       // millis() cuando se envió
+  unsigned long cooldown_ms;   // duración del lock (dinámico)
 };
 RecentBurst recentBursts[RECENT_BURSTS];
 uint8_t     recentBurstIdx = 0;
@@ -210,7 +213,7 @@ void sendBurst(uint16_t from_seq, uint16_t to_seq);
 bool seqInBuffer(uint16_t seq);
 bool seqInFlash(uint16_t seq);
 bool wasRecentlyBursted(uint16_t from_seq, uint16_t to_seq);
-void registerBurst(uint16_t from_seq, uint16_t to_seq);
+void registerBurst(uint16_t from_seq, uint16_t to_seq, unsigned long cooldown_ms);
 void addDays(int& year, int& month, int& day, int n);
 void gpsToISO_VET(int year, int month, int day,
                   int hour, int minute, int second, char* out);
@@ -245,7 +248,7 @@ bool loraApplyConfig() {
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
   if (!LoRa.begin(LORA_FREQ)) return false;
-  LoRa.setSpreadingFactor(12);
+  LoRa.setSpreadingFactor(11);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(6);
   LoRa.setTxPower(20);
@@ -448,23 +451,39 @@ void listenForReq() {
 
     // ── Anti-duplicado ───────────────────────────────────────
     if (wasRecentlyBursted(req.from_seq, req.to_seq)) {
-      Serial.printf("[REQ] Ignorado (burst reciente) seq %u..%u\n",
-                    req.from_seq, req.to_seq);
+      uint16_t miss = (uint16_t)(req.to_seq - req.from_seq + 1);
+      Serial.printf("[REQ] Ignorado (burst reciente) seq %u..%u (%u pkts)\n",
+                    req.from_seq, req.to_seq, miss);
       continue;  // no retransmitir
     }
-    // ─────────────────────────────────────────────────
+    // ───────────────────────────────────────────────────
+
+    uint16_t missing = (uint16_t)(req.to_seq - req.from_seq + 1);
+
+    // Validacion de rango: CRC puede pasar con datos corrompidos
+    // from_seq/to_seq aleatorios causan burst infinito -> WDT reset
+    if (missing == 0 || missing > 500) {
+      Serial.printf("[REQ] Rango invalido %u..%u (%u pkts), ignorado\n",
+                    req.from_seq, req.to_seq, missing);
+      continue;
+    }
 
     char msg[60];
     snprintf(msg, sizeof(msg), "[REQ] seq %u..%u (%u faltantes)",
-             req.from_seq, req.to_seq,
-             (uint16_t)(req.to_seq - req.from_seq + 1));
-    Serial.println(msg);
+             req.from_seq, req.to_seq, missing);
+    Serial.println(msg);  // imprimir ANTES de cambiar modo LoRa
+
+    // Cooldown dinamico: 3s por paquete + 30s de margen
+    unsigned long cooldownMs = (unsigned long)missing * BURST_COOLDOWN_PER_PKT + BURST_COOLDOWN_MIN;
+    Serial.printf("[REQ] Cooldown burst: %lu s\n", cooldownMs / 1000);
 
     // Registrar ANTES de enviar para bloquear REQ concurrentes
-    // que puedan llegar durante el burst
-    registerBurst(req.from_seq, req.to_seq);
+    registerBurst(req.from_seq, req.to_seq, cooldownMs);
 
+    // Dar tiempo al chip SX127x para pasar de RX -> Standby antes de TX
     LoRa.idle();
+    delay(20);
+    esp_task_wdt_reset();  // reiniciar WDT antes del burst (puede durar minutos)
     sendBurst(req.from_seq, req.to_seq);
     LoRa.receive();
     t0 = millis();  // extender ventana por si hay mas REQ de otros rangos
@@ -478,12 +497,12 @@ void listenForReq() {
 // ============================================================
 
 // Devuelve true si el rango (from_seq..to_seq) se solapa con
-// algun burst enviado hace menos de BURST_COOLDOWN_MS.
+// algun burst enviado hace menos de su cooldown dinámico.
 bool wasRecentlyBursted(uint16_t from_seq, uint16_t to_seq) {
   unsigned long now = millis();
   for (int i = 0; i < RECENT_BURSTS; i++) {
     if (recentBursts[i].sent_at == 0) continue;
-    if (now - recentBursts[i].sent_at > BURST_COOLDOWN_MS) continue;
+    if (now - recentBursts[i].sent_at > recentBursts[i].cooldown_ms) continue;
     if (from_seq <= recentBursts[i].to_seq &&
         to_seq   >= recentBursts[i].from_seq) {
       return true;
@@ -492,9 +511,9 @@ bool wasRecentlyBursted(uint16_t from_seq, uint16_t to_seq) {
   return false;
 }
 
-// Registra un burst recien enviado en el buffer circular
-void registerBurst(uint16_t from_seq, uint16_t to_seq) {
-  recentBursts[recentBurstIdx] = { from_seq, to_seq, millis() };
+// Registra un burst recien enviado con su cooldown dinamico
+void registerBurst(uint16_t from_seq, uint16_t to_seq, unsigned long cooldown_ms) {
+  recentBursts[recentBurstIdx] = { from_seq, to_seq, millis(), cooldown_ms };
   recentBurstIdx = (recentBurstIdx + 1) % RECENT_BURSTS;
 }
 
@@ -502,6 +521,10 @@ void registerBurst(uint16_t from_seq, uint16_t to_seq) {
 // ============================================================
 void sendBurst(uint16_t from_seq, uint16_t to_seq) {
   uint16_t sent = 0, skipped = 0;
+  uint16_t total = (uint16_t)(to_seq - from_seq + 1);
+  const char* src = "?";
+
+  Serial.printf("[BURST] Iniciando %u pkts (seq %u..%u)\n", total, from_seq, to_seq);
 
   for (uint16_t s = from_seq; s != (uint16_t)(to_seq + 1); s++) {
     esp_task_wdt_reset();
@@ -512,15 +535,26 @@ void sendBurst(uint16_t from_seq, uint16_t to_seq) {
     if (seqInBuffer(s)) {
       // ── Caso 1: está en la ventana RAM ───────────────────────
       const data_pkt_t& ramPkt = tx_buf[s % BUF_SIZE];
-      if (ramPkt.seq == s) pkt = &ramPkt;
+      if (ramPkt.seq == s) { pkt = &ramPkt; src = "RAM"; }
     }
 
     if (!pkt && seqInFlash(s)) {
       // ── Caso 2: fuera de RAM, buscar en LittleFS ──────────────
-      if (fsRead(s, tmp)) pkt = &tmp;
+      if (fsRead(s, tmp)) { pkt = &tmp; src = "FS"; }
+      else {
+        Serial.printf("[BURST] seq=%u FS read fallo\n", s);
+      }
     }
 
-    if (!pkt) { skipped++; continue; }
+    if (!pkt) {
+      skipped++;
+      // Solo mostrar los primeros 3 skips para no saturar el Serial
+      if (skipped <= 3) {
+        Serial.printf("[BURST] seq=%u skip (RAM=%c FS=%c)\n",
+                      s, seqInBuffer(s) ? 'Y' : 'N', seqInFlash(s) ? 'Y' : 'N');
+      }
+      continue;
+    }
 
     if (loraSendPacket((uint8_t*)pkt, sizeof(data_pkt_t))) {
       sent++;
@@ -537,8 +571,9 @@ void sendBurst(uint16_t from_seq, uint16_t to_seq) {
     delay(BURST_GAP_MS);
   }
 
-  char msg[60];
-  snprintf(msg, sizeof(msg), "[BURST] %u enviados %u omitidos", sent, skipped);
+  char msg[80];
+  snprintf(msg, sizeof(msg), "[BURST] OK=%u/%u skip=%u src=%s",
+           sent, total, skipped, sent > 0 ? src : "ninguna");
   Serial.println(msg);
 }
 

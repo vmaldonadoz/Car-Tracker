@@ -28,18 +28,18 @@
 #define MQTT_USE_TLS 0
 
 // ─── LoRa Pins ───────────────────────────────────────────────
-#define LORA_SCK  5
+#define LORA_SCK 5
 #define LORA_MISO 19
 #define LORA_MOSI 27
-#define LORA_SS   18
-#define LORA_RST  23
+#define LORA_SS 18
+#define LORA_RST 23
 #define LORA_DIO0 26
 #define LORA_FREQ 433E6
 
 // ─── Boton ───────────────────────────────────────────────────
-#define BUTTON_PIN    38
+#define BUTTON_PIN 38
 #define LONG_PRESS_MS 3000
-#define DEBOUNCE_MS   50
+#define DEBOUNCE_MS 50
 
 // ─── Reconexion ──────────────────────────────────────────────
 #define WIFI_RETRY_MS 15000
@@ -50,39 +50,42 @@
 
 // ─── Tipos de paquete ────────────────────────────────────────
 #define PKT_DATA 0x01
-#define PKT_REQ  0x02
+#define PKT_REQ 0x02
 
-#define TOPIC_GLOBAL    "tracker/global"
-#define TOPIC_REQ_LOCK  "tracker/req_lock"  // coordinacion de REQ entre RX
+#define TOPIC_GLOBAL "tracker/global"
+#define TOPIC_REQ_LOCK "tracker/req_lock"  // coordinacion de REQ entre RX
 
 // ─── Cola offline ────────────────────────────────────────────
-#define OFFLINE_DATA_FILE   "/ofq.bin"
+#define OFFLINE_DATA_FILE "/ofq.bin"
 #define OFFLINE_MAX_RECORDS 400
 
 // ─── Coordinacion de REQ entre multiples RX ──────────────────
 // Si este RX o cualquier otro ya pidio el mismo rango
-// hace menos de REQ_LOCK_MS, no volver a pedir
-#define REQ_LOCK_MS    9000   // un poco mayor que BURST_COOLDOWN_MS del TX (8000)
-#define MAX_REQ_LOCKS  8      // locks por device_id a recordar
+// no volver a pedir hasta que termine el burst estimado.
+// Con SF12 cada paquete del burst tarda ~2.9s (ToA + gap).
+// Lock minimo: 30s. Lock dinamico: N_faltantes * 3s + 30s de margen.
+#define REQ_LOCK_MIN_MS 30000  // minimo 30 segundos
+#define REQ_LOCK_PER_PKT 3000  // ~3s por paquete del burst (SF12)
+#define MAX_REQ_LOCKS 8        // locks por device_id a recordar
 
 // ─── Portal WiFi ─────────────────────────────────────────────
 #define CONFIG_AP_SSID_PREFIX "LoRa-Config-"
-#define CONFIG_AP_PASS        ""
+#define CONFIG_AP_PASS ""
 
 // ─── Estructuras ─────────────────────────────────────────────
 typedef struct __attribute__((packed)) {
-  uint8_t  pkt_type;
+  uint8_t pkt_type;
   uint16_t device_id;
   uint16_t seq;
-  char     timestamp[20];
-  int32_t  lat;
-  int32_t  lon;
+  char timestamp[20];
+  int32_t lat;
+  int32_t lon;
   uint16_t speed;
-  uint8_t  flags;
+  uint8_t flags;
 } data_pkt_t;
 
 typedef struct __attribute__((packed)) {
-  uint8_t  pkt_type;
+  uint8_t pkt_type;
   uint16_t device_id;
   uint16_t from_seq;
   uint16_t to_seq;
@@ -90,90 +93,101 @@ typedef struct __attribute__((packed)) {
 
 struct __attribute__((packed)) OfflineRecord {
   data_pkt_t pkt;
-  int16_t    rssi;
-  float      snr;
-  char       stationId[32];
+  int16_t rssi;
+  float snr;
+  char stationId[32];
 };
 
 static_assert(sizeof(data_pkt_t) == 36, "data_pkt_t size mismatch");
-static_assert(sizeof(req_pkt_t)  ==  7, "req_pkt_t size mismatch");
+static_assert(sizeof(req_pkt_t) == 7, "req_pkt_t size mismatch");
 
 // ─── Lock de REQ por vehiculo ────────────────────────────────
 struct ReqLock {
-  uint16_t      from_seq;
-  uint16_t      to_seq;
-  unsigned long locked_at;  // millis()
+  uint16_t from_seq;
+  uint16_t to_seq;
+  unsigned long locked_at;      // millis() cuando se registro el lock
+  unsigned long lock_duration;  // cuanto tiempo dura el lock (dinamico)
 };
+
 
 // ─── Estado por vehiculo ─────────────────────────────────────
 struct VehicleState {
-  uint16_t      device_id;
-  uint16_t      last_seq;
-  uint16_t      global_seq;
-  bool          initialized;
-  uint32_t      rx_count;
-  uint32_t      gap_count;
-  ReqLock       req_locks[MAX_REQ_LOCKS];
-  uint8_t       req_lock_idx;
+  uint16_t device_id;
+  uint16_t last_seq;
+  uint16_t global_seq;
+  bool initialized;
+  uint32_t rx_count;
+  uint32_t gap_count;
+  ReqLock req_locks[MAX_REQ_LOCKS];
+  uint8_t req_lock_idx;
+
+  // ── Gap pendiente (no resuelto) ─────────────────────────────
+  bool pending_active;  // hay un hueco que aun no se confirmo resuelto
+  uint16_t pending_from;
+  uint16_t pending_to;
+  unsigned long pending_expiry;  // cuando vence el lock que justifico no pedir
+  uint8_t pending_retries;       // cuantas veces ya reintentamos
 };
 VehicleState veh_states[MAX_VEHICLES];
+
+#define MAX_PENDING_RETRIES 3  // evita loop infinito si el TX no responde nunca
 
 // ─── Credenciales ────────────────────────────────────────────
 struct Credentials {
   char ssid[64];
   char pass[64];
   char broker[64];
-  int  port;
+  int port;
   char topicBase[96];
   char stationId[32];
   // ── Seguridad ─────────────────────────────────────
-  char mqttUser[32];   // usuario MQTT (vacio = sin auth)
-  char mqttPass[64];   // contrasena MQTT
-  char otaToken[64];   // token secreto — REQUERIDO para aceptar OTA
+  char mqttUser[32];  // usuario MQTT (vacio = sin auth)
+  char mqttPass[64];  // contrasena MQTT
+  char otaToken[64];  // token secreto — REQUERIDO para aceptar OTA
 };
 
 // ─── Globals ─────────────────────────────────────────────────
-Preferences  prefs;
-Credentials  creds;
+Preferences prefs;
+Credentials creds;
 // WiFiClientSecure si MQTT_USE_TLS=1; WiFiClient si =0
 #if MQTT_USE_TLS
-  WiFiClientSecure espClient;
+WiFiClientSecure espClient;
 #else
-  WiFiClient espClient;
+WiFiClient espClient;
 #endif
 PubSubClient mqtt(espClient);
-XPowersPMU   PMU;
+XPowersPMU PMU;
 
 WebServer configServer(80);
-bool      configMode = false;
+bool configMode = false;
 
 unsigned long buttonPressStart = 0;
-bool          buttonHeld       = false;
-bool          longPressHandled = false;
-unsigned long lastWifiRetry    = 0;
-unsigned long lastMqttRetry    = 0;
+bool buttonHeld = false;
+bool longPressHandled = false;
+unsigned long lastWifiRetry = 0;
+unsigned long lastMqttRetry = 0;
 
-uint32_t totalRx  = 0;
+uint32_t totalRx = 0;
 uint32_t totalPub = 0;
 uint32_t totalErr = 0;
 
 // ─── Contadores de error por razon ───────────────────────────
 // Permite diagnosticar exactamente que esta fallando
 enum ErrReason {
-  ERR_LORA_BAD_SIZE   = 0,   // paquete LoRa con tamano incorrecto
-  ERR_LORA_BAD_TYPE   = 1,   // tipo de paquete desconocido
-  ERR_BAD_DEVICE_ID   = 2,   // device_id == 0 o > 9999
-  ERR_BAD_LAT         = 3,   // latitud fuera de rango
-  ERR_BAD_LON         = 4,   // longitud fuera de rango
-  ERR_BAD_TIMESTAMP   = 5,   // timestamp vacio
-  ERR_MQTT_PUBLISH    = 6,   // mqtt.publish() fallo
-  ERR_MQTT_CONNECT    = 7,   // no se pudo conectar al broker
-  ERR_REASON_COUNT    = 8
+  ERR_LORA_BAD_SIZE = 0,  // paquete LoRa con tamano incorrecto
+  ERR_LORA_BAD_TYPE = 1,  // tipo de paquete desconocido
+  ERR_BAD_DEVICE_ID = 2,  // device_id == 0 o > 9999
+  ERR_BAD_LAT = 3,        // latitud fuera de rango
+  ERR_BAD_LON = 4,        // longitud fuera de rango
+  ERR_BAD_TIMESTAMP = 5,  // timestamp vacio
+  ERR_MQTT_PUBLISH = 6,   // mqtt.publish() fallo
+  ERR_MQTT_CONNECT = 7,   // no se pudo conectar al broker
+  ERR_REASON_COUNT = 8
 };
 const char* ERR_NAMES[ERR_REASON_COUNT] = {
   "lora_bad_size", "lora_bad_type",
   "bad_device_id", "bad_lat", "bad_lon", "bad_timestamp",
-  "mqtt_publish",  "mqtt_connect"
+  "mqtt_publish", "mqtt_connect"
 };
 uint32_t errCount[ERR_REASON_COUNT] = { 0 };
 
@@ -184,8 +198,8 @@ void countErr(ErrReason r) {
 }
 
 // ─── OTA topics ──────────────────────────────────────────────
-#define OTA_TOPIC_PREFIX  "tracker/cmd/"
-#define OTA_TOPIC_SUFFIX  "/ota"
+#define OTA_TOPIC_PREFIX "tracker/cmd/"
+#define OTA_TOPIC_SUFFIX "/ota"
 #define OTA_STATUS_PREFIX "tracker/status/"
 
 // ─── Forward declarations ────────────────────────────────────
@@ -204,22 +218,22 @@ void initLoRa();
 void publishHeartbeat();
 void doOTA(const String& version, const String& url);
 bool isReqLocked(VehicleState* v, uint16_t from_seq, uint16_t to_seq);
+bool isReqFullyLocked(VehicleState* v, uint16_t from, uint16_t to);
 void lockReq(VehicleState* v, uint16_t from_seq, uint16_t to_seq);
 void publishReqLock(uint16_t device_id, uint16_t from_seq, uint16_t to_seq);
-
+void checkPendingGaps();
 
 // ============================================================
 //  Coordinacion REQ: lock local + publicacion MQTT
 // ============================================================
 
 // Verifica si ya hay un lock activo para este rango
-// (publicado por este RX o recibido de otro via MQTT)
+
 bool isReqLocked(VehicleState* v, uint16_t from_seq, uint16_t to_seq) {
   unsigned long now = millis();
   for (int i = 0; i < MAX_REQ_LOCKS; i++) {
     if (v->req_locks[i].locked_at == 0) continue;
-    if (now - v->req_locks[i].locked_at > REQ_LOCK_MS) continue;
-    // Solapamiento de rangos
+    if (now - v->req_locks[i].locked_at > v->req_locks[i].lock_duration) continue;
     if (from_seq <= v->req_locks[i].to_seq &&
         to_seq   >= v->req_locks[i].from_seq) {
       return true;
@@ -228,9 +242,22 @@ bool isReqLocked(VehicleState* v, uint16_t from_seq, uint16_t to_seq) {
   return false;
 }
 
-// Registra el lock localmente
-void lockReq(VehicleState* v, uint16_t from_seq, uint16_t to_seq) {
-  v->req_locks[v->req_lock_idx] = { from_seq, to_seq, millis() };
+// NUEVA: solo devuelve true si el lock cubre el rango COMPLETO
+bool isReqFullyLocked(VehicleState* v, uint16_t from, uint16_t to) {
+  unsigned long now = millis();
+  for (int i = 0; i < MAX_REQ_LOCKS; i++) {
+    if (v->req_locks[i].locked_at == 0) continue;
+    if (now - v->req_locks[i].locked_at > v->req_locks[i].lock_duration) continue;
+    if (v->req_locks[i].from_seq <= from && v->req_locks[i].to_seq >= to) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Registra el lock localmente con duracion dinamica
+void lockReq(VehicleState* v, uint16_t from_seq, uint16_t to_seq, unsigned long duration_ms) {
+  v->req_locks[v->req_lock_idx] = { from_seq, to_seq, millis(), duration_ms };
   v->req_lock_idx = (v->req_lock_idx + 1) % MAX_REQ_LOCKS;
 }
 
@@ -300,26 +327,27 @@ void handleConfigRoot() {
 }
 
 void handleConfigSave() {
-  strlcpy(creds.ssid,      configServer.arg("ssid").c_str(),      sizeof(creds.ssid));
-  strlcpy(creds.pass,      configServer.arg("pass").c_str(),      sizeof(creds.pass));
-  strlcpy(creds.broker,    configServer.arg("broker").c_str(),    sizeof(creds.broker));
+  strlcpy(creds.ssid, configServer.arg("ssid").c_str(), sizeof(creds.ssid));
+  strlcpy(creds.pass, configServer.arg("pass").c_str(), sizeof(creds.pass));
+  strlcpy(creds.broker, configServer.arg("broker").c_str(), sizeof(creds.broker));
   creds.port = configServer.arg("port").toInt();
   if (creds.port == 0) creds.port = 1883;
-  strlcpy(creds.topicBase, configServer.arg("topic").c_str(),     sizeof(creds.topicBase));
-  strlcpy(creds.stationId, configServer.arg("station").c_str(),   sizeof(creds.stationId));
-  strlcpy(creds.mqttUser,  configServer.arg("mqttuser").c_str(),  sizeof(creds.mqttUser));
-  strlcpy(creds.mqttPass,  configServer.arg("mqttpass").c_str(),  sizeof(creds.mqttPass));
-  strlcpy(creds.otaToken,  configServer.arg("otatoken").c_str(),  sizeof(creds.otaToken));
+  strlcpy(creds.topicBase, configServer.arg("topic").c_str(), sizeof(creds.topicBase));
+  strlcpy(creds.stationId, configServer.arg("station").c_str(), sizeof(creds.stationId));
+  strlcpy(creds.mqttUser, configServer.arg("mqttuser").c_str(), sizeof(creds.mqttUser));
+  strlcpy(creds.mqttPass, configServer.arg("mqttpass").c_str(), sizeof(creds.mqttPass));
+  strlcpy(creds.otaToken, configServer.arg("otatoken").c_str(), sizeof(creds.otaToken));
 
   saveCredentials();
 
   String warn = (strlen(creds.otaToken) < 8)
-    ? "<p style='color:red'>&#9888; Token OTA vacio o muy corto &mdash; OTA bloqueado.</p>"
-    : "<p style='color:green'>&#10003; Token OTA configurado correctamente.</p>";
+                  ? "<p style='color:red'>&#9888; Token OTA vacio o muy corto &mdash; OTA bloqueado.</p>"
+                  : "<p style='color:green'>&#10003; Token OTA configurado correctamente.</p>";
 
   configServer.send(200, "text/html",
-    "<html><body style='font-family:sans-serif;text-align:center;margin-top:50px'>"
-    "<h2>Guardado correctamente</h2>" + warn + "<p>Reiniciando...</p></body></html>");
+                    "<html><body style='font-family:sans-serif;text-align:center;margin-top:50px'>"
+                    "<h2>Guardado correctamente</h2>"
+                      + warn + "<p>Reiniciando...</p></body></html>");
 
   delay(1000);
   ESP.restart();
@@ -347,15 +375,15 @@ bool loadCredentials() {
   prefs.begin("config", true);
   bool exists = prefs.isKey("ssid");
   if (exists) {
-    strlcpy(creds.ssid,      prefs.getString("ssid",    "").c_str(), sizeof(creds.ssid));
-    strlcpy(creds.pass,      prefs.getString("pass",    "").c_str(), sizeof(creds.pass));
-    strlcpy(creds.broker,    prefs.getString("broker",  "").c_str(), sizeof(creds.broker));
+    strlcpy(creds.ssid, prefs.getString("ssid", "").c_str(), sizeof(creds.ssid));
+    strlcpy(creds.pass, prefs.getString("pass", "").c_str(), sizeof(creds.pass));
+    strlcpy(creds.broker, prefs.getString("broker", "").c_str(), sizeof(creds.broker));
     creds.port = prefs.getInt("port", 1883);
-    strlcpy(creds.topicBase, prefs.getString("topic",   "gps/vehiculos").c_str(), sizeof(creds.topicBase));
-    strlcpy(creds.stationId, prefs.getString("station", "parada").c_str(),        sizeof(creds.stationId));
-    strlcpy(creds.mqttUser,  prefs.getString("muser",   "").c_str(), sizeof(creds.mqttUser));
-    strlcpy(creds.mqttPass,  prefs.getString("mpass",   "").c_str(), sizeof(creds.mqttPass));
-    strlcpy(creds.otaToken,  prefs.getString("otatk",   "").c_str(), sizeof(creds.otaToken));
+    strlcpy(creds.topicBase, prefs.getString("topic", "gps/vehiculos").c_str(), sizeof(creds.topicBase));
+    strlcpy(creds.stationId, prefs.getString("station", "parada").c_str(), sizeof(creds.stationId));
+    strlcpy(creds.mqttUser, prefs.getString("muser", "").c_str(), sizeof(creds.mqttUser));
+    strlcpy(creds.mqttPass, prefs.getString("mpass", "").c_str(), sizeof(creds.mqttPass));
+    strlcpy(creds.otaToken, prefs.getString("otatk", "").c_str(), sizeof(creds.otaToken));
   }
   prefs.end();
   bool valid = exists && strlen(creds.ssid) > 0 && strlen(creds.broker) > 0;
@@ -367,15 +395,15 @@ bool loadCredentials() {
 
 void saveCredentials() {
   prefs.begin("config", false);
-  prefs.putString("ssid",    creds.ssid);
-  prefs.putString("pass",    creds.pass);
-  prefs.putString("broker",  creds.broker);
-  prefs.putInt("port",       creds.port);
-  prefs.putString("topic",   creds.topicBase);
+  prefs.putString("ssid", creds.ssid);
+  prefs.putString("pass", creds.pass);
+  prefs.putString("broker", creds.broker);
+  prefs.putInt("port", creds.port);
+  prefs.putString("topic", creds.topicBase);
   prefs.putString("station", creds.stationId);
-  prefs.putString("muser",   creds.mqttUser);
-  prefs.putString("mpass",   creds.mqttPass);
-  prefs.putString("otatk",   creds.otaToken);
+  prefs.putString("muser", creds.mqttUser);
+  prefs.putString("mpass", creds.mqttPass);
+  prefs.putString("otatk", creds.otaToken);
   prefs.end();
 }
 
@@ -462,17 +490,19 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     if (rxId && String(rxId) == String(creds.stationId)) return;
 
     uint16_t device_id = (uint16_t)topicStr.substring(topicStr.lastIndexOf('/') + 1).toInt();
-    uint16_t from_seq  = doc["from"] | 0;
-    uint16_t to_seq    = doc["to"]   | 0;
+    uint16_t from_seq = doc["from"] | 0;
+    uint16_t to_seq = doc["to"] | 0;
+    uint16_t missing = (uint16_t)(to_seq - from_seq + 1);
 
     VehicleState* v = findOrCreateVehicle(device_id);
     if (!v) return;
 
-    // Registrar el lock localmente — este RX no pedira este rango
-    lockReq(v, from_seq, to_seq);
+    // Lock con la misma duracion dinamica que usaria este RX
+    unsigned long lockMs = (unsigned long)missing * REQ_LOCK_PER_PKT + REQ_LOCK_MIN_MS;
+    lockReq(v, from_seq, to_seq, lockMs);
 
-    Serial.printf("[REQ_LOCK] Bus #%u seq %u..%u ya pedido por %s\n",
-                  device_id, from_seq, to_seq, rxId ? rxId : "?");
+    Serial.printf("[REQ_LOCK] Bus #%u seq %u..%u ya pedido por %s (lock %lu s)\n",
+                  device_id, from_seq, to_seq, rxId ? rxId : "?", lockMs / 1000);
     return;
   }
 
@@ -481,7 +511,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     char* lastSlash = strrchr(topic, '/');
     if (!lastSlash) return;
 
-    uint16_t device_id  = (uint16_t)atoi(lastSlash + 1);
+    uint16_t device_id = (uint16_t)atoi(lastSlash + 1);
     if (device_id == 0) return;
 
     char buf[16] = { 0 };
@@ -495,7 +525,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       v->global_seq = global_seq;
     }
     if (!v->initialized) {
-      v->last_seq    = global_seq;
+      v->last_seq = global_seq;
       v->initialized = true;
       Serial.printf("[MQTT] Bus #%u inicializado desde retained: last_seq=%u\n",
                     device_id, global_seq);
@@ -507,10 +537,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 void connectMQTT() {
   if (mqtt.connected() || WiFi.status() != WL_CONNECTED) return;
 
-  // ── Capa 3: TLS (cifrado de transporte, opcional) ────────────
-  // Requiere que el broker escuche en puerto TLS (tipicamente 8883).
-  // setInsecure() cifra sin validar el certificado CA del broker.
-  // Para validacion completa: usar espClient.setCACert("...").
+    // ── Capa 3: TLS (cifrado de transporte, opcional) ────────────
+    // Requiere que el broker escuche en puerto TLS (tipicamente 8883).
+    // setInsecure() cifra sin validar el certificado CA del broker.
+    // Para validacion completa: usar espClient.setCACert("...").
 #if MQTT_USE_TLS
   espClient.setInsecure();
 #endif
@@ -558,11 +588,11 @@ void connectMQTT() {
     // rc codes: -4=TIMEOUT -3=LOST -2=FAILED -1=DISCONNECTED 1=BAD_PROTO
     //            2=BAD_CLIENTID 3=UNAVAILABLE 4=BAD_CREDS 5=UNAUTHORIZED
     Serial.printf("[MQTT] Fallo rc=%d (%s)\n", mqtt.state(),
-      mqtt.state() == -4 ? "TIMEOUT" :
-      mqtt.state() == -3 ? "LOST" :
-      mqtt.state() == -2 ? "FAILED" :
-      mqtt.state() ==  4 ? "BAD_CREDS" :
-      mqtt.state() ==  5 ? "UNAUTHORIZED" : "otro");
+                  mqtt.state() == -4 ? "TIMEOUT" : mqtt.state() == -3 ? "LOST"
+                                                 : mqtt.state() == -2 ? "FAILED"
+                                                 : mqtt.state() == 4  ? "BAD_CREDS"
+                                                 : mqtt.state() == 5  ? "UNAUTHORIZED"
+                                                                      : "otro");
     countErr(ERR_MQTT_CONNECT);
   }
 }
@@ -654,9 +684,12 @@ void initPMU() {
     Serial.println("[PMU] AXP2101 no encontrado");
     return;
   }
-  PMU.setDC1Voltage(3300);  PMU.enableDC1();
-  PMU.setALDO2Voltage(3300); PMU.enableALDO2();
-  PMU.setALDO3Voltage(3300); PMU.enableALDO3();
+  PMU.setDC1Voltage(3300);
+  PMU.enableDC1();
+  PMU.setALDO2Voltage(3300);
+  PMU.enableALDO2();
+  PMU.setALDO3Voltage(3300);
+  PMU.enableALDO3();
   Serial.println("[PMU] OK");
 }
 
@@ -667,7 +700,7 @@ void initLoRa() {
     Serial.println("[LoRa] ERROR");
     while (1) delay(1000);
   }
-  LoRa.setSpreadingFactor(12);
+  LoRa.setSpreadingFactor(11);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(6);
   LoRa.enableCrc();
@@ -703,7 +736,7 @@ void saveOffline(const data_pkt_t& pkt, int rssi, float snr) {
   OfflineRecord rec;
   memcpy(&rec.pkt, &pkt, sizeof(data_pkt_t));
   rec.rssi = (int16_t)rssi;
-  rec.snr  = snr;
+  rec.snr = snr;
   strlcpy(rec.stationId, creds.stationId, sizeof(rec.stationId));
   fw.write((uint8_t*)&rec, sizeof(OfflineRecord));
   fw.close();
@@ -719,12 +752,19 @@ void flushOfflineQueue() {
   if (!f) return;
 
   uint32_t total = f.size() / sizeof(OfflineRecord);
-  if (total == 0) { f.close(); LittleFS.remove(OFFLINE_DATA_FILE); return; }
+  if (total == 0) {
+    f.close();
+    LittleFS.remove(OFFLINE_DATA_FILE);
+    return;
+  }
 
   Serial.printf("[FS] Flushing %u paquetes...\n", total);
 
   File tmp = LittleFS.open("/ofq_tmp.bin", "w");
-  if (!tmp) { f.close(); return; }
+  if (!tmp) {
+    f.close();
+    return;
+  }
 
   uint32_t sent = 0, kept = 0;
   bool mqttFailed = false;
@@ -760,7 +800,8 @@ void flushOfflineQueue() {
     }
   }
 
-  f.close(); tmp.close();
+  f.close();
+  tmp.close();
   LittleFS.remove(OFFLINE_DATA_FILE);
 
   if (kept > 0) {
@@ -799,9 +840,19 @@ void setup() {
 }
 
 void loop() {
-  if (configMode) { configServer.handleClient(); return; }
+  if (configMode) {
+    configServer.handleClient();
+    return;
+  }
 
   checkButton();
+
+  // ─── Reintento de gaps pendientes ────────────────────────
+  static unsigned long lastGapCheck = 0;
+  if (millis() - lastGapCheck > 10000) {
+    lastGapCheck = millis();
+    checkPendingGaps();
+  }
 
   // ─── Heartbeat independiente de LoRa ─────────────────────
   static unsigned long lastHeartbeat = 0;
@@ -878,7 +929,7 @@ void publishHeartbeat() {
   // Construir detalle de errores por razon
   char errDetail[220];
   int pos = 0;
-  pos += snprintf(errDetail + pos, sizeof(errDetail) - pos, ",\"err_detail\":{" );
+  pos += snprintf(errDetail + pos, sizeof(errDetail) - pos, ",\"err_detail\":{");
   for (int i = 0; i < ERR_REASON_COUNT; i++) {
     pos += snprintf(errDetail + pos, sizeof(errDetail) - pos,
                     "\"%s\":%lu%s", ERR_NAMES[i], errCount[i],
@@ -888,15 +939,15 @@ void publishHeartbeat() {
 
   char buf[512];
   snprintf(buf, sizeof(buf),
-      "{\"status\":\"online\",\"firmware\":\"%s\","
-      "\"power\":\"%s\",\"charging\":%s,\"battery_percent\":%u,"
-      "\"wifi_rssi\":%d,\"rx\":%lu,\"pub\":%lu,\"err\":%lu%s}",
-      FIRMWARE_VERSION,
-      PMU.isVbusIn() ? "usb" : "battery",
-      PMU.isCharging() ? "true" : "false",
-      PMU.getBatteryPercent(),
-      WiFi.RSSI(),
-      totalRx, totalPub, totalErr, errDetail);
+           "{\"status\":\"online\",\"firmware\":\"%s\","
+           "\"power\":\"%s\",\"charging\":%s,\"battery_percent\":%u,"
+           "\"wifi_rssi\":%d,\"rx\":%lu,\"pub\":%lu,\"err\":%lu%s}",
+           FIRMWARE_VERSION,
+           PMU.isVbusIn() ? "usb" : "battery",
+           PMU.isCharging() ? "true" : "false",
+           PMU.getBatteryPercent(),
+           WiFi.RSSI(),
+           totalRx, totalPub, totalErr, errDetail);
 
   mqtt.publish(topic, buf, true);
   Serial.printf("[HB] %s\n", buf);
@@ -947,33 +998,55 @@ void handleDataPacket(const data_pkt_t& pkt, int rssi, float snr) {
       // Secuencia correcta
       v->last_seq = pkt.seq;
 
-    } else if ((uint16_t)(pkt.seq - v->last_seq) > 1) {
-      // GAP detectado
+    } else if ((int16_t)(pkt.seq - v->last_seq) > 1) {
+      // GAP detectado (pkt.seq esta adelante de last_seq por mas de 1)
       uint16_t from    = (uint16_t)(v->last_seq + 1);
       uint16_t to      = (uint16_t)(pkt.seq - 1);
       uint16_t missing = (uint16_t)(to - from + 1);
 
-      Serial.printf("[GAP] Bus #%u: faltan seq %u..%u (%u paquetes)\n",
-                    pkt.device_id, from, to, missing);
-      v->gap_count++;
-      hasGap = true;
-
-      // ── Coordinacion multi-RX ─────────────────────────────
-      if (!isReqLocked(v, from, to)) {
-        // Nadie ha pedido este rango todavia
-        lockReq(v, from, to);                          // bloquear localmente
-        publishReqLock(pkt.device_id, from, to);       // avisar a otros RX
-        delay(random(20, 80));                         // evitar colision si dos RX lo ven al mismo tiempo
-        sendReq(pkt.device_id, from, to);             // pedir al TX
+      // Sanidad extra: el rango debe ser coherente (from <= to en espacio uint16)
+      if (from > to && (uint32_t)to + 1 != (uint32_t)from) {
+        Serial.printf("[GAP] Rango anomalo ignorado: from=%u to=%u\n", from, to);
+        v->last_seq = pkt.seq;
       } else {
-        Serial.printf("[REQ_LOCK] Bus #%u seq %u..%u ya pedido, skip\n",
-                      pkt.device_id, from, to);
+        Serial.printf("[GAP] Bus #%u: faltan seq %u..%u (%u paquetes)\n",
+                      pkt.device_id, from, to, missing);
+        v->gap_count++;
+        hasGap = true;
+
+        // ── Coordinacion multi-RX ─────────────────────────────
+        if (!isReqFullyLocked(v, from, to)) {
+          // Nadie cubre el rango completo todavia -> lo pedimos nosotros
+          unsigned long lockMs = (unsigned long)missing * REQ_LOCK_PER_PKT + REQ_LOCK_MIN_MS;
+          lockReq(v, from, to, lockMs);                 // bloquear localmente
+          publishReqLock(pkt.device_id, from, to);      // avisar a otros RX
+          Serial.printf("[REQ] Lock por %lu s para %u paquetes\n", lockMs/1000, missing);
+          delay(random(20, 80));                        // evitar colision
+          sendReq(pkt.device_id, from, to);              // pedir al TX
+
+          v->pending_active  = true;
+          v->pending_from    = from;
+          v->pending_to      = to;
+          v->pending_expiry  = millis() + lockMs;
+          v->pending_retries = 0;
+        } else {
+          Serial.printf("[REQ_LOCK] Bus #%u seq %u..%u cubierto por lock existente, esperando retransmision\n",
+                        pkt.device_id, from, to);
+
+          // Igual lo marcamos como pendiente, por si el que lo pidio
+          // nunca lo termina de resolver
+          v->pending_active  = true;
+          v->pending_from    = from;
+          v->pending_to      = to;
+          v->pending_expiry  = millis() + REQ_LOCK_MIN_MS;
+          v->pending_retries = 0;
+        }
+        // ─────────────────────────────────────────────────────
+
+        v->last_seq = pkt.seq;
       }
-      // ─────────────────────────────────────────────────────
 
-      v->last_seq = pkt.seq;
-
-    } else if ((uint16_t)(pkt.seq - v->last_seq) == 0) {
+    } else if ((int16_t)(pkt.seq - v->last_seq) == 0) {
       // Duplicado exacto — ignorar silenciosamente
       return;
 
@@ -982,10 +1055,22 @@ void handleDataPacket(const data_pkt_t& pkt, int rssi, float snr) {
       // Publicar igual (rellena el hueco en el backend)
       Serial.printf("[RETX] Bus #%u seq=%u (last_seq=%u) — publicando retransmision\n",
                     pkt.device_id, pkt.seq, v->last_seq);
-      // No actualizar last_seq — ya avanzamos mas alla de este seq
       v->rx_count++;
       printPacket(pkt, rssi, snr, false);
       publishPacket(pkt, rssi, snr);
+
+      // Si esta retransmision empieza a llenar el hueco pendiente,
+      // achicar el rango pendiente desde el frente
+      if (v->pending_active && pkt.seq >= v->pending_from && pkt.seq <= v->pending_to) {
+        if (pkt.seq == v->pending_from) {
+          v->pending_from++;
+          if (v->pending_from > v->pending_to) {
+            v->pending_active = false;
+            Serial.printf("[GAP-RESUELTO] Bus #%u: hueco llenado por retransmision\n",
+                          pkt.device_id);
+          }
+        }
+      }
       return;  // return directo, sin tocar last_seq
     }
   }
@@ -995,16 +1080,15 @@ void handleDataPacket(const data_pkt_t& pkt, int rssi, float snr) {
   publishPacket(pkt, rssi, snr);
 }
 
-
 // ============================================================
 //  Enviar REQ al TX
 // ============================================================
 void sendReq(uint16_t device_id, uint16_t from_seq, uint16_t to_seq) {
   req_pkt_t req;
-  req.pkt_type  = PKT_REQ;
+  req.pkt_type = PKT_REQ;
   req.device_id = device_id;
-  req.from_seq  = from_seq;
-  req.to_seq    = to_seq;
+  req.from_seq = from_seq;
+  req.to_seq = to_seq;
 
   LoRa.beginPacket();
   LoRa.write((uint8_t*)&req, sizeof(req));
@@ -1012,6 +1096,38 @@ void sendReq(uint16_t device_id, uint16_t from_seq, uint16_t to_seq) {
 
   Serial.printf("[REQ->] Bus #%u: pidiendo seq %u..%u\n",
                 device_id, from_seq, to_seq);
+}
+
+
+void checkPendingGaps() {
+  unsigned long now = millis();
+  for (int i = 0; i < MAX_VEHICLES; i++) {
+    VehicleState* v = &veh_states[i];
+    if (!v->initialized || !v->pending_active) continue;
+    if (now < v->pending_expiry) continue;
+
+    if (v->pending_retries >= MAX_PENDING_RETRIES) {
+      Serial.printf("[GAP-GIVEUP] Bus #%u seq %u..%u: agotados los reintentos\n",
+                    v->device_id, v->pending_from, v->pending_to);
+      v->pending_active = false;
+      continue;
+    }
+
+    uint16_t from = v->pending_from;
+    uint16_t to   = v->pending_to;
+    uint16_t missing = (uint16_t)(to - from + 1);
+    unsigned long lockMs = (unsigned long)missing * REQ_LOCK_PER_PKT + REQ_LOCK_MIN_MS;
+
+    Serial.printf("[GAP-RETRY] Bus #%u seq %u..%u sin resolver, reintentando (intento %u)\n",
+                  v->device_id, from, to, v->pending_retries + 1);
+
+    lockReq(v, from, to, lockMs);
+    publishReqLock(v->device_id, from, to);
+    sendReq(v->device_id, from, to);
+
+    v->pending_expiry = now + lockMs;
+    v->pending_retries++;
+  }
 }
 
 

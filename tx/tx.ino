@@ -47,8 +47,8 @@
 #define SPEED_THRESHOLD  2.0f
 
 // ─── Protocolo ───────────────────────────────────────────────
-#define LISTEN_WINDOW_MS  1200
-#define BURST_GAP_MS      80
+#define LISTEN_WINDOW_MS  3000   // SF12 ToA ~2.8s: margen suficiente para REQ de ida/vuelta
+#define BURST_GAP_MS      100    // pausa entre paquetes del burst (ms)
 #define BUF_SIZE          2400     // ventana RAM: últimos N paquetes (~84 KB, ~3.3 h)
 #define FS_BUF_SIZE       29000   // capacidad flash (~1 MB, ajustar según partición)
 #define FS_BUF_FILE       "/buf.bin"
@@ -304,7 +304,7 @@ bool loraApplyConfig() {
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
   if (!LoRa.begin(LORA_FREQ)) return false;
-  LoRa.setSpreadingFactor(12);
+  LoRa.setSpreadingFactor(11);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(6);
   LoRa.setTxPower(20);
@@ -499,13 +499,27 @@ void listenForReq() {
     LoRa.readBytes((uint8_t*)&req, sizeof(req));
     if (req.pkt_type != PKT_REQ || req.device_id != DEVICE_ID) continue;
 
-    char msg[60];
-    snprintf(msg, sizeof(msg), "[REQ] seq %u..%u (%u faltantes)",
-             req.from_seq, req.to_seq,
-             (uint16_t)(req.to_seq - req.from_seq + 1));
-    bleNotify(msg);
+    uint16_t missing = (uint16_t)(req.to_seq - req.from_seq + 1);
 
+    // Validacion de rango: paquetes corrompidos (CRC pasa pero datos basura)
+    // pueden tener from_seq/to_seq aleatorios causando burst infinito -> WDT reset
+    if (missing == 0 || missing > 500) {
+      char err[60];
+      snprintf(err, sizeof(err), "[REQ] Rango invalido %u..%u (%u), ignorado",
+               req.from_seq, req.to_seq, missing);
+      bleNotify(err);
+      continue;
+    }
+
+    char msg[64];
+    snprintf(msg, sizeof(msg), "[REQ] seq %u..%u (%u faltantes)",
+             req.from_seq, req.to_seq, missing);
+    bleNotify(msg);  // notificar ANTES de cambiar modo LoRa
+
+    // Dar tiempo al chip SX127x para pasar de RX -> Standby antes de TX
     LoRa.idle();
+    delay(20);
+    esp_task_wdt_reset();  // reiniciar WDT antes del burst (puede durar minutos)
     sendBurst(req.from_seq, req.to_seq);
     LoRa.receive();
     t0 = millis();
@@ -517,6 +531,11 @@ void listenForReq() {
 // ============================================================
 void sendBurst(uint16_t from_seq, uint16_t to_seq) {
   uint16_t sent = 0, skipped = 0;
+  uint16_t total = (uint16_t)(to_seq - from_seq + 1);
+  const char* lastSrc = "ninguna";  // fuente del ultimo paquete enviado
+
+  // Nota: el bleNotify de inicio ya fue enviado en listenForReq()
+  // para evitar conflictos BLE/SPI durante la transicion de modo LoRa
 
   for (uint16_t s = from_seq; s != (uint16_t)(to_seq + 1); s++) {
     esp_task_wdt_reset();
@@ -527,15 +546,32 @@ void sendBurst(uint16_t from_seq, uint16_t to_seq) {
     if (seqInBuffer(s)) {
       // ── Caso 1: está en la ventana RAM ───────────────────────
       const data_pkt_t& ramPkt = tx_buf[s % BUF_SIZE];
-      if (ramPkt.seq == s) pkt = &ramPkt;
+      if (ramPkt.seq == s) { pkt = &ramPkt; lastSrc = "RAM"; }
     }
 
     if (!pkt && seqInFlash(s)) {
       // ── Caso 2: fuera de RAM, buscar en LittleFS ──────────────
-      if (fsRead(s, tmp)) pkt = &tmp;
+      if (fsRead(s, tmp)) { pkt = &tmp; lastSrc = "FS"; }
+      else {
+        char dbg[50];
+        snprintf(dbg, sizeof(dbg), "[BURST] seq=%u FS read fallo", s);
+        bleNotify(dbg);
+      }
     }
 
-    if (!pkt) { skipped++; continue; }
+    if (!pkt) {
+      skipped++;
+      bool inRam = seqInBuffer(s);
+      bool inFs  = seqInFlash(s);
+      // Solo notificar los primeros 3 skips para no saturar BLE
+      if (skipped <= 3) {
+        char dbg[60];
+        snprintf(dbg, sizeof(dbg), "[BURST] seq=%u skip (RAM=%c FS=%c)",
+                 s, inRam ? 'Y' : 'N', inFs ? 'Y' : 'N');
+        bleNotify(dbg);
+      }
+      continue;
+    }
 
     if (loraSendPacket((uint8_t*)pkt, sizeof(data_pkt_t))) {
       sent++;
@@ -552,8 +588,9 @@ void sendBurst(uint16_t from_seq, uint16_t to_seq) {
     delay(BURST_GAP_MS);
   }
 
-  char msg[60];
-  snprintf(msg, sizeof(msg), "[BURST] %u enviados %u omitidos", sent, skipped);
+  char msg[80];
+  snprintf(msg, sizeof(msg), "[BURST] OK=%u/%u skip=%u src=%s",
+           sent, total, skipped, lastSrc);
   bleNotify(msg);
 }
 
