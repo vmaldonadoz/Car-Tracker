@@ -1,0 +1,1325 @@
+/*
+  GPS-MQTT.ino  —  Tracker GPS L76K + MQTT Nativo (A7670G)
+  ──────────────────────────────────────────────────────────
+  Lee posición del GPS Quectel L76K via TinyGPS++,
+  construye el mismo JSON que publica el rx.ino y lo envía
+  por MQTT nativo del módem A7670G (AT+CMQTT*).
+
+  JSON publicado (igual que publishPacket() en rx.ino):
+    {
+      "device_id": <uint>,
+      "ts":        "<YYYY-MM-DDTHH:MM:SS>",
+      "lat":       <float 7 dec>,
+      "lon":       <float 7 dec>,
+      "speed":     <float 1 dec>,
+      "flags":     <uint>,
+      "seq":       <uint>
+    }
+
+  Topics (mismo esquema que rx.ino):
+    <TOPIC_BASE>/<DEVICE_ID>          ← datos JSON   (QoS 1)
+    tracker/global/<DEVICE_ID>        ← seq retained (QoS 1)
+
+  Plataforma: LilyGO T-A7670G  (ESP32 + módem A7670G)
+  GPS:        Quectel L76K (solo RX, pin GPIO 22)
+*/
+
+// ─── Identificación del dispositivo ────────────────────────────
+#define DEVICE_ID 1
+
+// ─── SIM y APN ─────────────────────────────────────────────────
+#define SIM_PIN "" // dejar vacío si la SIM no tiene PIN
+#define NETWORK_APN "internet.movistar.ve"
+
+// ─── Pines LilyGO T-A7670G ────────────────────────────────────
+#define MODEM_BAUDRATE 115200
+#define MODEM_TX_PIN 26
+#define MODEM_RX_PIN 27
+#define BOARD_PWRKEY_PIN 4
+#define BOARD_POWERON_PIN 12 // HIGH = alimenta el módulo A7670G
+#define MODEM_RESET_PIN 5
+#define MODEM_RESET_LEVEL HIGH
+#define SerialAT Serial1
+
+// ─── Pines GPS L76K ────────────────────────────────────────────
+// Solo recibimos NMEA del GPS; TX del ESP no está conectado.
+#define GPS_RX_PIN 22 // GPIO que recibe el TX del L76K
+#define GPS_BAUD 9600
+HardwareSerial GPS(2); // UART2 del ESP32
+
+// ─── MQTT broker ───────────────────────────────────────────────
+const char *broker = "200.44.171.179";
+const int port = 4033;
+
+// ─── Topics (mismo esquema que rx.ino) ─────────────────────────
+#define TOPIC_BASE "gps/vehiculos" // <topicBase>/<device_id>
+#define TOPIC_GLOBAL "gps/global"  // retained con el seq
+
+// ─── ID de esta estación (equivale a stationId del rx) ────────
+#define STATION_ID "hoatzin"
+
+// ─── Umbrales de movimiento real ─────────────────────────────────────
+#define DISTANCE_MIN_M 15.0f // metros mínimos entre publicaciones en movimiento
+#define MIN_SPEED_KMPH 2.0f  // km/h mínimo para considerar movimiento real
+#define HDOP_MAX 1.5f        // HDOP máximo aceptable
+#define SAT_MIN 5            // satélites mínimos requeridos
+
+// EMA adaptativo
+#define EMA_ALPHA_MOVING 0.4f // cuando está en movimiento
+#define EMA_ALPHA_STILL 0.05f // cuando está detenido — filtro muy agresivo
+
+// Hysteresis de velocidad: cuántas lecturas consecutivas por encima
+// del umbral antes de declarar "en movimiento"
+#define MOVING_CONFIRM_COUNT 2
+
+// Cooldown mínimo entre publicaciones consecutivas en movimiento (ms)
+#define PUB_COOLDOWN_MS 5000UL
+
+// Heartbeat estacionario: publicar aunque no haya movimiento
+// para confirmar que el tracker está activo y reportar última posición.
+#define STATIONARY_HEARTBEAT_MS 300000UL // cada 5 minutos
+
+// ─── Tamaño máximo del JSON de payload ─────────────────────────
+//  device_id(5)+ts(19)+lat(12)+lon(12)+flags(1)+seq(5) + claves ≈ 95
+#define JSON_BUF_SIZE 160
+
+// ─── Variables watchdog ───────────────────────────────────────────
+uint32_t lastModemCheck = 0;
+#define MODEM_CHECK_INTERVAL 120000UL // verificar cada 2 minutos
+
+// ─── Log periódico del GPS ───────────────────────────────────────
+uint32_t lastGpsLog = 0;
+#define GPS_LOG_INTERVAL 30000UL // imprimir estado cada 30 s
+
+// ─── Heartbeat estacionario ─────────────────────────────────────
+uint32_t lastHeartbeat = 0; // última publicación de posición estacionaria
+
+// ─── Almacenamiento offline (store-and-forward) ─────────────────
+#define OFFLINE_DATA_FILE "/ofq.bin"
+#define OFFLINE_MAX_RECORDS 5000
+
+// ═══════════════════════════════════════════════════════════════
+//  ESTRUCTURA DEL PAQUETE (packed, 36 bytes) — misma que tx/rx
+// ═══════════════════════════════════════════════════════════════
+#define PKT_DATA 0x01
+
+typedef struct __attribute__((packed)) {
+  uint8_t pkt_type;   //  1 byte  – offset  0
+  uint16_t device_id; //  2 bytes – offset  1
+  uint16_t seq;       //  2 bytes – offset  3
+  char timestamp[20]; // 20 bytes – offset  5
+  int32_t lat;        //  4 bytes – offset 25
+  int32_t lon;        //  4 bytes – offset 29
+  uint16_t speed;     //  2 bytes – offset 33
+  uint8_t flags;      //  1 byte  – offset 35
+} data_pkt_t;         // = 36 bytes total
+
+static_assert(sizeof(data_pkt_t) == 36, "data_pkt_t size mismatch");
+
+// ─── Estado global ─────────────────────────────────────────────
+#include <LittleFS.h>
+#include <TinyGPS++.h>
+TinyGPSPlus gps;
+uint16_t gSeq = 0;
+bool mqttConnected = false;
+uint32_t lastReconnect = 0;
+unsigned long lastFlush = 0;
+// ─── Última posición publicada (para trigger por distancia) ───────
+double lastLat = 0.0;
+double lastLon = 0.0;
+bool hasLastPos = false;
+// ─── EMA suavizado de coordenadas ─────────────────────────────────
+double smoothLat = 0.0;
+double smoothLon = 0.0;
+bool emaReady = false;
+
+// ─── Hysteresis de movimiento ─────────────────────────────────────────
+uint8_t movingConfirm = 0;  // contador de lecturas "rápidas"
+bool isMovingState = false; // estado filtrado: en movimiento o no
+uint32_t lastPubMs = 0;     // timestamp de última publicación
+
+// ─── Buffer de URCs asíncronos ────────────────────────────────
+static String urcPending = ""; // URCs recibidos durante comandos AT
+
+// ═══════════════════════════════════════════════════════════════
+//  HELPERS AT  (extraídos del MQTT.ino de referencia)
+// ═══════════════════════════════════════════════════════════════
+
+void flushModem() {
+  delay(50);
+  while (SerialAT.available())
+    SerialAT.read();
+}
+
+bool sendAT(const String &cmd, const String &expected = "OK",
+            uint32_t ms = 5000) {
+  flushModem();
+  SerialAT.println(cmd);
+  String buf;
+  uint32_t t0 = millis();
+  while (millis() - t0 < ms) {
+    while (SerialAT.available()) {
+      char c = SerialAT.read();
+      buf += c;
+      if (c == '\n') {
+        if (buf.indexOf("+CGEV: NW PDN DEACT") != -1 ||
+            buf.indexOf("+CMQTTNONET") != -1 ||
+            buf.indexOf("+CMQTTCONNLOST") != -1) {
+          urcPending += buf;
+        }
+      }
+    }
+    if (buf.indexOf(expected) != -1)
+      return true;
+    if (buf.indexOf("ERROR") != -1)
+      return false;
+  }
+  return false;
+}
+
+String sendATStr(const String &cmd, uint32_t ms = 5000) {
+  flushModem();
+  SerialAT.println(cmd);
+  String buf;
+  uint32_t t0 = millis();
+  while (millis() - t0 < ms) {
+    while (SerialAT.available()) {
+      char c = SerialAT.read();
+      buf += c;
+
+      // Acumular líneas completas y detectar URCs
+      if (c == '\n') {
+        if (buf.indexOf("+CGEV: NW PDN DEACT") != -1 ||
+            buf.indexOf("+CMQTTNONET") != -1 ||
+            buf.indexOf("+CMQTTCONNLOST") != -1) {
+          urcPending += buf; // guardar para procesar en loop()
+        }
+      }
+    }
+    if (buf.indexOf("OK") != -1 || buf.indexOf("ERROR") != -1)
+      break;
+  }
+  return buf;
+}
+
+// Espera el prompt '>' y envía datos (texto o binario)
+bool waitPromptAndSend(const uint8_t *data, int len, uint32_t ms = 5000) {
+  String buf;
+  uint32_t t0 = millis();
+  while (millis() - t0 < ms) {
+    while (SerialAT.available())
+      buf += (char)SerialAT.read();
+    if (buf.indexOf(">") != -1) {
+      SerialAT.write(data, len);
+      delay(100);
+      return true;
+    }
+    if (buf.indexOf("ERROR") != -1) {
+      Serial.print("[AT] Prompt ERROR: ");
+      Serial.println(buf);
+      return false;
+    }
+  }
+  Serial.print("[AT] Sin prompt '>': ");
+  Serial.println(buf);
+  return false;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  MQTT NATIVO — publicación de texto/JSON (AT+CMQTT*)
+// ═══════════════════════════════════════════════════════════════
+
+/*
+  mqttPublishText:
+    Publica un string de texto en el topic indicado.
+    Opcionalmente con retain flag (último parámetro de AT+CMQTTPUB).
+
+  Flujo AT (igual que MQTT.ino de referencia):
+    1. AT+CMQTTTOPIC=0,<len>   → espera '>' → envía topic
+    2. AT+CMQTTPAYLOAD=0,<len> → espera '>' → envía payload
+    3. AT+CMQTTPUB=0,<qos>,60,<retain>
+       → espera "+CMQTTPUB: 0,0" para confirmación
+*/
+bool mqttPublishText(const char *topic, const char *payload, int qos = 1,
+                     int retain = 0) {
+  int tLen = strlen(topic);
+  int pLen = strlen(payload);
+
+  // ── 1) Topic ──────────────────────────────────────────────────
+  flushModem();
+  SerialAT.println("AT+CMQTTTOPIC=0," + String(tLen));
+  if (!waitPromptAndSend((const uint8_t *)topic, tLen)) {
+    Serial.println("[MQTT] Fallo en TOPIC");
+    return false;
+  }
+  delay(200);
+
+  // ── 2) Payload ────────────────────────────────────────────────
+  flushModem();
+  SerialAT.println("AT+CMQTTPAYLOAD=0," + String(pLen));
+  if (!waitPromptAndSend((const uint8_t *)payload, pLen)) {
+    Serial.println("[MQTT] Fallo en PAYLOAD");
+    return false;
+  }
+  delay(200);
+
+  // ── 3) Publicar ──────────────────────────────────────────────
+  // AT+CMQTTPUB=<index>,<qos>,<timeout_s>,<retained>
+  flushModem();
+  SerialAT.println("AT+CMQTTPUB=0," + String(qos) + ",60," + String(retain));
+
+  String buf;
+  uint32_t t0 = millis();
+  while (millis() - t0 < 60000UL) {
+    while (SerialAT.available())
+      buf += (char)SerialAT.read();
+    if (buf.indexOf("+CMQTTPUB: 0,0") != -1)
+      return true;
+    if (buf.indexOf("ERROR") != -1) {
+      Serial.print("[MQTT] PUB ERROR: ");
+      Serial.println(buf);
+      return false;
+    }
+  }
+  Serial.println("[MQTT] PUB timeout");
+  return false;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  PUBLICAR PAQUETE — mismo esquema que publishPacket() del rx.ino
+// ═══════════════════════════════════════════════════════════════
+
+/*
+  publishPacket:
+    Reproduce exactamente el JSON que construye publishPacket() en rx.ino,
+    usando AT+CMQTT* en lugar de mqtt.publish() de PubSubClient.
+
+    Topic principal : TOPIC_BASE/device_id              (QoS 1, no retain)
+    Topic global    : tracker/global/device_id (retain)  (QoS 1, retain=1)
+*/
+void publishPacket(const data_pkt_t &pkt) {
+
+  char topic[64];
+  snprintf(topic, sizeof(topic), "%s/%u", TOPIC_BASE, pkt.device_id);
+
+  char buf[JSON_BUF_SIZE];
+  snprintf(buf, sizeof(buf),
+           "{\"device_id\":%u,\"ts\":\"%s\",\"lat\":%.7f,\"lon\":%.7f,"
+           "\"speed\":%.1f,"
+           "\"flags\":%u,\"seq\":%u}",
+           pkt.device_id, pkt.timestamp, pkt.lat / 1e7f, pkt.lon / 1e7f,
+           pkt.speed / 10.0f, pkt.flags, pkt.seq);
+
+  Serial.printf("[MQTT] → %s\n%s\n", topic, buf);
+
+  bool ok = mqttPublishText(topic, buf, /*qos=*/0, /*retain=*/0);
+  if (ok) {
+    Serial.printf("[MQTT] PUB OK  seq=%u\n", pkt.seq);
+  } else {
+    Serial.printf("[MQTT] PUB FAIL  seq=%u\n", pkt.seq);
+    mqttConnected = false;
+  }
+}
+
+// ─── Configura DNS público en el módem ──────────────────────────────────
+// Las SIMs Movistar en el pool 10.173.x.x no reciben DNS interno.
+// Forzar Google Public DNS resuelve el fallo +CDNSGIP: 0,10.
+void configureDNS() {
+  Serial.println("[NET] Configurando DNS públicos (8.8.8.8 / 8.8.4.4)...");
+  String r = sendATStr("AT+CDNSCFG=\"8.8.8.8\",\"8.8.4.4\"", 5000);
+  Serial.print("[NET] DNS cfg: ");
+  Serial.println(r);
+}
+
+// ─── Detecta sesión LTE "fantasma" (MCC/MNC=000-00, banda=0) ─────────────
+// Cuando la SIM obtiene registro pero el contexto de datos no se ancló
+// a una celda real, AT+CPSI devuelve 000-00 y DNS falla aunque haya IP.
+bool isPDPSessionValid() {
+  String cpsi = sendATStr("AT+CPSI?", 5000);
+  Serial.print("[NET] CPSI: ");
+  Serial.println(cpsi);
+
+  // Sesión inválida: MCC=000 o BAND=0 → módem no enganchado a celda real
+  if (cpsi.indexOf("000-00") != -1 || cpsi.indexOf("EUTRAN-BAND0") != -1) {
+    Serial.println("[NET] ⚠ Sesión LTE fantasma detectada (celda 000-00)");
+    return false;
+  }
+  // Si no hay respuesta CPSI útil tampoco es válida
+  if (cpsi.indexOf("+CPSI:") == -1) {
+    Serial.println("[NET] ⚠ Sin respuesta CPSI");
+    return false;
+  }
+  return true;
+}
+
+// ─── Fuerza re-enganche completo a la red ────────────────────────────────
+// Útil cuando la SIM está en estado "fantasma": tiene IP pero sin celda real.
+bool forceReattach() {
+  Serial.println("[NET] Forzando re-enganche (COPS deregister)...");
+
+  // Desactivar PDP primero
+  sendAT("AT+CGACT=0,1", "OK", 10000);
+  delay(500);
+
+  // Deregistrar de la red y volver a modo automático
+  sendAT("AT+COPS=2", "OK", 15000); // desconectar de operador
+  delay(3000);
+  sendAT("AT+COPS=0", "OK", 30000); // reconectar automático
+  delay(2000);
+
+  // Esperar registro real (con celda válida)
+  Serial.print("[NET] Esperando re-registro");
+  for (int i = 0; i < 30; i++) {
+    String r = sendATStr("AT+CREG?", 3000);
+    if (r.indexOf(",1") != -1 || r.indexOf(",5") != -1) {
+      // Verificar que la celda sea real antes de continuar
+      if (isPDPSessionValid() || i > 20) { // tras 20 s aceptar igual
+        Serial.println(" OK");
+        return true;
+      }
+    }
+    Serial.print(".");
+    delay(2000);
+  }
+  Serial.println("\n[NET] Re-enganche falló");
+  return false;
+}
+
+bool reactivatePDP() {
+  Serial.println("[NET] Reactivando contexto PDP...");
+
+  // Desactivar y volver a activar
+  sendAT("AT+CGACT=0,1", "OK", 10000);
+  delay(1000);
+
+  for (int i = 0; i < 3; i++) {
+    if (sendAT("AT+CGACT=1,1", "OK", 30000)) {
+      String ip = sendATStr("AT+CGPADDR=1", 5000);
+      Serial.print("[NET] IP tras reactivar: ");
+      Serial.println(ip);
+      bool hasIp = ip.indexOf("186.") != -1 || ip.indexOf("10.") != -1 ||
+                   ip.indexOf("172.") != -1 || ip.indexOf("192.") != -1;
+      if (!hasIp) {
+        delay(3000);
+        continue;
+      }
+
+      // Verificar que no sea una sesión fantasma
+      if (!isPDPSessionValid()) {
+        Serial.println(
+            "[NET] Sesión inválida tras reactivar — forzando re-enganche");
+        forceReattach();
+        // Reactivar PDP después del re-enganche
+        sendAT("AT+CGDCONT=1,\"IP\",\"" NETWORK_APN "\"", "OK", 5000);
+        sendAT("AT+CGACT=1,1", "OK", 30000);
+        ip = sendATStr("AT+CGPADDR=1", 5000);
+        Serial.print("[NET] IP tras re-enganche: ");
+        Serial.println(ip);
+      }
+      // Siempre (re)configurar DNS después de activar PDP
+      configureDNS();
+      return true;
+    }
+    delay(3000);
+  }
+  Serial.println("[NET] Fallo reactivando PDP");
+  return false;
+}
+
+void diagNetwork() {
+  Serial.println("\n─── DIAGNÓSTICO DE RED ───────────────────");
+
+  // ── Test básico de comunicación AT ───────────────────────────
+  Serial.println("[AT] Enviando AT...");
+  flushModem();
+  SerialAT.println("AT");
+  delay(1000);
+  String raw = "";
+  while (SerialAT.available())
+    raw += (char)SerialAT.read();
+  Serial.print("[AT] Respuesta raw: '");
+  Serial.print(raw);
+  Serial.println("'");
+
+  if (raw.length() == 0) {
+    Serial.println("[AT] ⚠ SIN RESPUESTA — UART o módem caído");
+    return;
+  }
+
+  // Estado de registro
+  String creg = sendATStr("AT+CREG?", 3000);
+  String cgreg = sendATStr("AT+CGREG?", 3000);
+  String cereg = sendATStr("AT+CEREG?", 3000);
+  Serial.print("[NET] CREG:  ");
+  Serial.println(creg);
+  Serial.print("[NET] CGREG: ");
+  Serial.println(cgreg);
+  Serial.print("[NET] CEREG: ");
+  Serial.println(cereg);
+
+  // Calidad de señal
+  String csq = sendATStr("AT+CSQ", 3000);
+  Serial.print("[NET] CSQ:   ");
+  Serial.println(csq);
+
+  // Operador actual
+  String cops = sendATStr("AT+COPS?", 5000);
+  Serial.print("[NET] COPS:  ");
+  Serial.println(cops);
+
+  // Estado PDP
+  String cgact = sendATStr("AT+CGACT?", 3000);
+  Serial.print("[NET] CGACT: ");
+  Serial.println(cgact);
+
+  Serial.println("──────────────────────────────────────────\n");
+}
+
+// ─── Watchdog del módem ───────────────────────────────────────
+// Retorna true si el módem responde a AT, false si está colgado
+bool modemIsAlive() {
+  flushModem();
+  SerialAT.println("AT");
+  String buf;
+  uint32_t t0 = millis();
+  while (millis() - t0 < 2000) {
+    while (SerialAT.available())
+      buf += (char)SerialAT.read();
+    if (buf.indexOf("OK") != -1)
+      return true;
+  }
+  return false;
+}
+
+// Reset hardware completo del A7670G via PWRKEY
+// Igual que en setup() pero sin reiniciar el ESP32
+void hardResetModem() {
+  Serial.println("[MDM] ⚠ Módem no responde — reset hardware...");
+
+  // Apagar: pulso largo en PWRKEY (>1.2 s apaga el módulo)
+  digitalWrite(BOARD_PWRKEY_PIN, HIGH);
+  delay(1500);
+  digitalWrite(BOARD_PWRKEY_PIN, LOW);
+  delay(2000); // esperar que apague completamente
+
+  // Encender: pulso corto en PWRKEY
+  digitalWrite(BOARD_PWRKEY_PIN, HIGH);
+  delay(100);
+  digitalWrite(BOARD_PWRKEY_PIN, LOW);
+
+  // Esperar que el módulo arranque y responda AT (~8-12 s)
+  Serial.print("[MDM] Esperando arranque");
+  int retry = 0;
+  while (!modemIsAlive()) {
+    Serial.print(".");
+    delay(1000);
+    if (retry++ > 20) {
+      Serial.println("\n[MDM] ⚠ Módem no arranca — reiniciando ESP32");
+      ESP.restart(); // último recurso
+    }
+  }
+  Serial.println(" OK");
+
+  // Restaurar configuración básica
+  sendAT("ATE0", "OK");
+  sendAT("AT+CMEE=2", "OK");
+
+  // Esperar registro de red
+  Serial.print("[MDM] Esperando red");
+  for (int i = 0; i < 30; i++) {
+    if (isNetworkUp()) {
+      Serial.println(" OK");
+      return;
+    }
+    Serial.print(".");
+    delay(2000);
+  }
+  Serial.println("\n[MDM] ⚠ Sin red tras reset");
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  CONEXIÓN MQTT
+// ═══════════════════════════════════════════════════════════════
+
+bool mqttConnect() {
+  Serial.printf("[MQTT] Conectando a %s:%d\n", broker, port);
+
+  // ── Verificar que el módem esté vivo ─────────────────────────
+  if (!modemIsAlive()) {
+    hardResetModem();
+
+    // Reactivar PDP tras el reset
+    sendAT("AT+CGDCONT=1,\"IP\",\"" NETWORK_APN "\"", "OK", 5000);
+    for (int i = 0; i < 3; i++) {
+      if (sendAT("AT+CGACT=1,1", "OK", 30000))
+        break;
+      delay(3000);
+    }
+  }
+
+  // ── Verificar red antes de continuar ─────────────────────────
+  if (!isNetworkUp()) {
+    Serial.println("[MQTT] Sin registro de red");
+    return false;
+  }
+
+  // ── Verificar/reactivar PDP ───────────────────────────────────
+  String pdpCheck = sendATStr("AT+CGACT?", 5000);
+  if (pdpCheck.indexOf("+CGACT: 1,1") == -1) {
+    Serial.println("[MQTT] PDP caído — reactivando...");
+    if (!reactivatePDP()) {
+      Serial.println("[MQTT] No se pudo reactivar PDP");
+      return false;
+    }
+  }
+
+  // ── Limpieza agresiva: intentar hasta 3 veces ────────────────
+  bool accqOk = false;
+  for (int attempt = 0; attempt < 3 && !accqOk; attempt++) {
+    if (attempt > 0) {
+      Serial.printf("[MQTT] Reintento limpieza #%d\n", attempt);
+      delay(3000);
+    }
+
+    // Secuencia completa de limpieza — ignorar resultados
+    sendAT("AT+CMQTTDISC=0,10", "OK", 12000);
+    delay(800);
+    sendAT("AT+CMQTTREL=0", "OK", 3000);
+    delay(800);
+    sendAT("AT+CMQTTSTOP", "OK", 8000);
+    delay(2500); // pausa crítica para cerrar socket TCP interno
+
+    // Arrancar stack limpio
+    if (!sendAT("AT+CMQTTSTART", "OK", 10000)) {
+      Serial.println("[MQTT] CMQTTSTART falló — reintentando");
+      continue;
+    }
+    delay(500);
+
+    // Verificar PDP activo antes de continuar (CMQTTSTOP puede haberlo bajado)
+    {
+      String pdp = sendATStr("AT+CGACT?", 3000);
+      if (pdp.indexOf("+CGACT: 1,1") == -1) {
+        Serial.println("[MQTT] PDP caído tras CMQTTSTOP — reactivando");
+        sendAT("AT+CGDCONT=1,\"IP\",\"" NETWORK_APN "\"", "OK", 5000);
+        for (int p = 0; p < 3; p++) {
+          if (sendAT("AT+CGACT=1,1", "OK", 30000))
+            break;
+          delay(3000);
+        }
+        configureDNS();
+      }
+    }
+
+    // Adquirir cliente 0 — clientId FIJO para identificación estable
+    // en el broker (el broker desconecta la sesión anterior automáticamente).
+    char clientId[24];
+    snprintf(clientId, sizeof(clientId), "tracker_%u", DEVICE_ID);
+    String accq = "AT+CMQTTACCQ=0,\"";
+    accq += clientId;
+    accq += "\",0";
+    Serial.printf("[MQTT] ClientID: %s\n", clientId);
+
+    if (sendAT(accq, "OK", 5000)) {
+      accqOk = true;
+    } else {
+      Serial.println("[MQTT] CMQTTACCQ falló — limpiando de nuevo");
+      delay(2000);
+    }
+  }
+
+  if (!accqOk) {
+    Serial.println("[MQTT] No se pudo adquirir cliente MQTT tras 3 intentos");
+    return false;
+  }
+
+  // ── Conectar al broker ────────────────────────────────────────
+  String cmd = "AT+CMQTTCONNECT=0,\"tcp://";
+  cmd += broker;
+  cmd += ":";
+  cmd += port;
+  cmd += "\",60,1";
+
+  flushModem();
+  SerialAT.println(cmd);
+
+  String buf;
+  uint32_t t0 = millis();
+  bool gotConnAck = false;
+  while (millis() - t0 < 20000) {
+    while (SerialAT.available())
+      buf += (char)SerialAT.read();
+    if (buf.indexOf("+CMQTTCONNECT: 0,0") != -1)
+      gotConnAck = true;
+    if (gotConnAck && buf.indexOf("OK") != -1)
+      break;
+    if (buf.indexOf("+CMQTTCONNLOST") != -1)
+      break;
+    if (buf.indexOf("ERROR") != -1)
+      break;
+  }
+
+  if (!gotConnAck) {
+    Serial.print("[MQTT] fail (sin CONNACK): ");
+    Serial.println(buf);
+    return false;
+  }
+  if (buf.indexOf("+CMQTTCONNLOST") != -1) {
+    Serial.println("[MQTT] fail (CONNLOST inmediato)");
+    return false;
+  }
+
+  Serial.println("[MQTT] Conectado OK");
+  delay(1000);
+  return true;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  CONSTRUCCIÓN DEL PAQUETE GPS
+// ═══════════════════════════════════════════════════════════════
+
+/*  Convierte fecha/hora UTC del GPS a hora Venezuela (UTC-4)
+    y formatea como "YYYY-MM-DDTHH:MM:SS" en 'out' (20 bytes).   */
+void gpsToISO_VET(int year, int month, int day, int hour, int minute,
+                  int second, char *out) {
+  static const uint8_t dim[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+
+  // Workaround GPS week rollover
+  if (year < 2019) {
+    day += 7168;
+    while (true) {
+      bool leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+      int d = (month == 2 && leap) ? 29 : dim[month - 1];
+      if (day <= d)
+        break;
+      day -= d;
+      if (++month > 12) {
+        month = 1;
+        year++;
+      }
+    }
+  }
+
+  // UTC → VET (UTC-4)
+  hour -= 4;
+  if (hour < 0) {
+    hour += 24;
+    day--;
+    if (day < 1) {
+      if (--month < 1) {
+        month = 12;
+        year--;
+      }
+      bool leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+      day = (month == 2 && leap) ? 29 : dim[month - 1];
+    }
+  }
+
+  snprintf(out, 20, "%04d-%02d-%02dT%02d:%02d:%02d", year, month, day, hour,
+           minute, second);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  RED MÓVIL — verificación rápida de registro
+// ═══════════════════════════════════════════════════════════════
+
+bool isNetworkUp() {
+  // Cualquier registro (GSM, GPRS o LTE) es suficiente.
+  // No requerir todos simultáneos: tras CMQTTSTOP el modem puede
+  // emitir +CGEV que baja CGREG temporalmente aunque siga en LTE.
+  String r = sendATStr("AT+CREG?", 3000);
+  if (r.indexOf(",1") != -1 || r.indexOf(",5") != -1)
+    return true;
+  String rg = sendATStr("AT+CGREG?", 3000);
+  if (rg.indexOf(",1") != -1 || rg.indexOf(",5") != -1)
+    return true;
+  String re = sendATStr("AT+CEREG?", 3000);
+  return re.indexOf(",1") != -1 || re.indexOf(",5") != -1;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ALMACENAMIENTO OFFLINE  (store-and-forward)
+// ═══════════════════════════════════════════════════════════════
+
+void initStorage() {
+  if (!LittleFS.begin(true)) {
+    Serial.println("[FS] Error montando LittleFS");
+  } else {
+    Serial.printf("[FS] LittleFS OK — %u / %u KB\n",
+                  LittleFS.usedBytes() / 1024, LittleFS.totalBytes() / 1024);
+  }
+}
+
+void saveOffline(const data_pkt_t &pkt) {
+  File f = LittleFS.open(OFFLINE_DATA_FILE, "r");
+  uint32_t count = f ? (f.size() / sizeof(data_pkt_t)) : 0;
+  if (f)
+    f.close();
+
+  if (count < OFFLINE_MAX_RECORDS) {
+    // Cola no llena: agregar al final directamente
+    File fw = LittleFS.open(OFFLINE_DATA_FILE, "a");
+    if (!fw) {
+      Serial.println("[FS] Error abriendo archivo");
+      return;
+    }
+    fw.write((uint8_t *)&pkt, sizeof(data_pkt_t));
+    fw.close();
+    Serial.printf("[FS] Guardado offline seq=%u bus#%u (total=%u)\n", pkt.seq,
+                  pkt.device_id, count + 1);
+  } else {
+    // Cola llena: descartar el más antiguo, agregar el nuevo al final
+    File src = LittleFS.open(OFFLINE_DATA_FILE, "r");
+    File tmp = LittleFS.open("/ofq_tmp.bin", "w");
+    if (!src || !tmp) {
+      if (src)
+        src.close();
+      if (tmp)
+        tmp.close();
+      Serial.println("[FS] Error en rotación circular");
+      return;
+    }
+
+    // Saltar el primer registro (el más antiguo)
+    src.seek(sizeof(data_pkt_t));
+
+    // Copiar los restantes al archivo temporal
+    uint8_t cbuf[sizeof(data_pkt_t)];
+    while (src.readBytes((char *)cbuf, sizeof(data_pkt_t)) ==
+           sizeof(data_pkt_t))
+      tmp.write(cbuf, sizeof(data_pkt_t));
+
+    // Agregar el nuevo paquete al final
+    tmp.write((uint8_t *)&pkt, sizeof(data_pkt_t));
+
+    src.close();
+    tmp.close();
+
+    LittleFS.remove(OFFLINE_DATA_FILE);
+    LittleFS.rename("/ofq_tmp.bin", OFFLINE_DATA_FILE);
+
+    Serial.printf(
+        "[FS] Buffer circular: seq=%u guardado (antiguo descartado)\n",
+        pkt.seq);
+  }
+}
+
+void flushOfflineQueue() {
+  if (!mqttConnected || !LittleFS.exists(OFFLINE_DATA_FILE))
+    return;
+
+  File f = LittleFS.open(OFFLINE_DATA_FILE, "r");
+  if (!f)
+    return;
+
+  uint32_t total = f.size() / sizeof(data_pkt_t);
+  if (total == 0) {
+    f.close();
+    LittleFS.remove(OFFLINE_DATA_FILE);
+    return;
+  }
+
+  Serial.printf("[FS] Enviando %u paquetes almacenados...\n", total);
+
+  File tmp = LittleFS.open("/ofq_tmp.bin", "w");
+  if (!tmp) {
+    f.close();
+    return;
+  }
+
+  uint32_t sent = 0, kept = 0;
+  bool mqttFailed = false;
+
+  while (f.available() >= (int)sizeof(data_pkt_t)) {
+    data_pkt_t pkt;
+    f.readBytes((char *)&pkt, sizeof(data_pkt_t));
+
+    if (!mqttFailed && mqttConnected) {
+      char topic[128];
+      snprintf(topic, sizeof(topic), "%s/%u", TOPIC_BASE, pkt.device_id);
+
+      char buf[JSON_BUF_SIZE];
+      snprintf(buf, sizeof(buf),
+               "{\"device_id\":%u,\"ts\":\"%s\",\"lat\":%.7f,\"lon\":%.7f,"
+               "\"speed\":%.1f,\"flags\":%u,\"seq\":%u,\"stored\":true}",
+               pkt.device_id, pkt.timestamp, pkt.lat / 1e7f, pkt.lon / 1e7f,
+               pkt.speed / 10.0f, pkt.flags, pkt.seq);
+
+      bool ok = mqttPublishText(topic, buf, /*qos=*/0, /*retain=*/0);
+      if (ok) {
+        sent++;
+      } else {
+        mqttFailed = true;
+        mqttConnected = false;
+        tmp.write((uint8_t *)&pkt, sizeof(data_pkt_t));
+        kept++;
+      }
+    } else {
+      tmp.write((uint8_t *)&pkt, sizeof(data_pkt_t));
+      kept++;
+    }
+  }
+
+  f.close();
+  tmp.close();
+  LittleFS.remove(OFFLINE_DATA_FILE);
+
+  if (kept > 0) {
+    LittleFS.rename("/ofq_tmp.bin", OFFLINE_DATA_FILE);
+    Serial.printf("[FS] Flush parcial: %u enviados, %u pendientes\n", sent,
+                  kept);
+  } else {
+    LittleFS.remove("/ofq_tmp.bin");
+    Serial.printf("[FS] Flush completo: %u paquetes enviados\n", sent);
+  }
+}
+
+/*  buildAndPublish:
+    Lee el GPS, arma el pkt y lo publica como JSON via AT+CMQTT*
+    siguiendo el mismo formato que publishPacket() del rx.ino.     */
+bool buildAndPublish() {
+  bool hasFix =
+      gps.location.isValid() && gps.date.isValid() && gps.time.isValid();
+  bool hdopOk = hasFix && gps.hdop.isValid() && (gps.hdop.hdop() < HDOP_MAX);
+  bool moving = hasFix && gps.speed.isValid() && (gps.speed.kmph() >= 2.0f);
+
+  data_pkt_t pkt;
+  pkt.pkt_type = PKT_DATA;
+  pkt.device_id = DEVICE_ID;
+  pkt.seq = gSeq++;
+  pkt.flags = 0;
+
+  if (hasFix) {
+    bool hasSats =
+        !gps.satellites.isValid() || (gps.satellites.value() >= SAT_MIN);
+    if (!hasSats) {
+      Serial.printf("[GPS] Satélites insuficientes (%u < %u) — cancelado\n",
+                    gps.satellites.value(), SAT_MIN);
+      return false;
+    }
+    // Usar coordenadas suavizadas por EMA (definidas en loop)
+    pkt.lat = (int32_t)(smoothLat * 1e7);
+    pkt.lon = (int32_t)(smoothLon * 1e7);
+    pkt.speed = (uint16_t)(gps.speed.kmph() * 10.0f);
+    gpsToISO_VET(gps.date.year(), gps.date.month(), gps.date.day(),
+                 gps.time.hour(), gps.time.minute(), gps.time.second(),
+                 pkt.timestamp);
+    pkt.flags |= 0x01; // bit0 = fix válido
+    if (hdopOk)
+      pkt.flags |= 0x02; // bit1 = HDOP OK
+    if (moving)
+      pkt.flags |= 0x04; // bit2 = en movimiento
+  } else {
+    Serial.println("[GPS] Sin fix — publicación cancelada");
+    return false;
+  }
+
+  // Debug por Serial (mismo formato que printPacket() del rx.ino)
+  Serial.printf("[PKT] Bus#%-4u seq=%-5u %s fix=%c | %+.5f,%+.5f | %.1f km/h\n",
+                pkt.device_id, pkt.seq, pkt.timestamp,
+                (pkt.flags & 0x01) ? 'Y' : 'N', pkt.lat / 1e7f, pkt.lon / 1e7f,
+                pkt.speed / 10.0f);
+
+  // ── Verificar red móvil antes de publicar ────────────────────
+  if (!isNetworkUp()) {
+    Serial.println("[NET] Sin red móvil — guardando offline");
+    saveOffline(pkt);
+    mqttConnected = false; // forzar reconexión cuando vuelva la red
+    return false;
+  }
+
+  if (!mqttConnected) {
+    Serial.println("[MQTT] Sin conexión MQTT — guardando offline");
+    saveOffline(pkt);
+    return false;
+  }
+
+  publishPacket(pkt);
+  return true;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════════════════════════
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n[BOOT] GPS-MQTT Tracker — iniciando...");
+  Serial.printf("[BOOT] Topic datos:  %s/%u\n", TOPIC_BASE, DEVICE_ID);
+  Serial.printf("[BOOT] Topic global: %s/%u\n", TOPIC_GLOBAL, DEVICE_ID);
+  Serial.printf("[BOOT] Struct size:  %u bytes\n",
+                (unsigned)sizeof(data_pkt_t));
+
+  // ── Iniciar SerialAT ─────────────────────────────────────────
+  SerialAT.begin(MODEM_BAUDRATE, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
+
+  // ── Alimentar el módulo A7670G ───────────────────────────────
+  // GPIO 12 habilita el regulador; DEBE estar en HIGH antes que todo
+  pinMode(BOARD_POWERON_PIN, OUTPUT);
+  digitalWrite(BOARD_POWERON_PIN, HIGH);
+  delay(100);
+
+  // ── Reset hardware del módulo ────────────────────────────────
+  pinMode(MODEM_RESET_PIN, OUTPUT);
+  digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
+  delay(100);
+  digitalWrite(MODEM_RESET_PIN, MODEM_RESET_LEVEL);
+  delay(2600);
+  digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
+
+  // ── Pulso en PWRKEY para encender ───────────────────────────
+  pinMode(BOARD_PWRKEY_PIN, OUTPUT);
+  digitalWrite(BOARD_PWRKEY_PIN, LOW);
+  delay(100);
+  digitalWrite(BOARD_PWRKEY_PIN, HIGH);
+  delay(100);
+  digitalWrite(BOARD_PWRKEY_PIN, LOW);
+
+  // ── Esperar que el módem responda a AT ──────────────────────
+  Serial.print("[BOOT] Esperando módem");
+  int retry = 0;
+  while (!sendAT("AT", "OK", 1000)) {
+    Serial.print(".");
+    if (retry++ > 10) {
+      digitalWrite(BOARD_PWRKEY_PIN, LOW);
+      delay(100);
+      digitalWrite(BOARD_PWRKEY_PIN, HIGH);
+      delay(1000);
+      digitalWrite(BOARD_PWRKEY_PIN, LOW);
+      retry = 0;
+    }
+  }
+  Serial.println(" OK");
+
+  sendAT("ATE0", "OK");      // desactivar eco
+  sendAT("AT+CMEE=2", "OK"); // errores legibles
+
+  delay(1000);
+
+  diagSIMNetwork();
+
+  // ── Verificar SIM ────────────────────────────────────────────
+  while (true) {
+    String r = sendATStr("AT+CPIN?", 3000);
+    if (r.indexOf("READY") != -1) {
+      Serial.println("[SIM] SIM lista");
+      break;
+    }
+    if (r.indexOf("SIM PIN") != -1) {
+      Serial.println("[SIM] SIM bloqueada — introduciendo PIN");
+      if (strlen(SIM_PIN) > 0)
+        sendAT("AT+CPIN=\"" SIM_PIN "\"", "OK", 5000);
+    }
+    delay(1000);
+  }
+
+  // ── Modo de red y APN ────────────────────────────────────────
+  sendAT("AT+CNMP=2", "OK", 5000); // modo automático (LTE/3G/2G)
+  sendAT("AT+CGDCONT=1,\"IP\",\"" NETWORK_APN "\"", "OK", 5000);
+
+  // ── Esperar registro en red ──────────────────────────────────
+  // CREG=3 (rechazado) durante sesión fantasma es TEMPORAL:
+  // no abandonar — intentar re-enganche y seguir esperando.
+  Serial.print("[NET] Esperando registro");
+  int rejectCount = 0;
+  while (true) {
+    String r = sendATStr("AT+CREG?", 3000);
+    if (r.indexOf(",1") != -1 || r.indexOf(",5") != -1) {
+      Serial.println(" — Registrado");
+      break;
+    }
+    if (r.indexOf(",3") != -1) {
+      rejectCount++;
+      Serial.printf("\n[NET] Registro rechazado (%d) — forzando re-enganche\n",
+                    rejectCount);
+      // Reintentar re-enganche (máximo 3 veces antes de reiniciar ESP)
+      if (rejectCount >= 3) {
+        Serial.println("[NET] ⚠ Demasiados rechazos — reiniciando ESP32");
+        delay(2000);
+        ESP.restart();
+      }
+      // Desregistrar y re-registrar automáticamente
+      sendAT("AT+COPS=2", "OK", 15000);
+      delay(2000);
+      sendAT("AT+COPS=0", "OK", 30000);
+      delay(3000);
+      Serial.print("[NET] Esperando registro");
+      continue;
+    }
+    Serial.print(".");
+    delay(1000);
+  }
+
+  // ── Activar contexto PDP ─────────────────────────────────────
+  for (int i = 0; i < 3; i++) {
+    if (sendAT("AT+CGACT=1,1", "OK", 30000))
+      break;
+    sendAT("AT+CGACT=0,1", "OK", 5000);
+    delay(2000);
+  }
+  String ip = sendATStr("AT+CGPADDR=1", 5000);
+  Serial.print("[NET] IP: ");
+  Serial.println(ip);
+
+  // ── Verificar sesión LTE (detecta SIMs con sesión "fantasma") ────────
+  // Algunas SIMs obtienen registro y una IP interna pero sin ancla a
+  // celda real (CPSI muestra 000-00). En ese caso el DNS falla y MQTT
+  // nunca conecta. Se fuerza re-enganche antes de intentar MQTT.
+  if (!isPDPSessionValid()) {
+    Serial.println("[NET] ⚠ Sesión inicial inválida — forzando re-enganche");
+    if (forceReattach()) {
+      sendAT("AT+CGDCONT=1,\"IP\",\"" NETWORK_APN "\"", "OK", 5000);
+      for (int i = 0; i < 3; i++) {
+        if (sendAT("AT+CGACT=1,1", "OK", 30000))
+          break;
+        delay(3000);
+      }
+      ip = sendATStr("AT+CGPADDR=1", 5000);
+      Serial.print("[NET] IP tras re-enganche: ");
+      Serial.println(ip);
+    } else {
+      Serial.println("[NET] ⚠ Re-enganche falló — continuando de todas formas");
+    }
+  }
+
+  // ── Configurar DNS públicos (independiente del resultado de CPSI) ────
+  configureDNS();
+
+  // ── Almacenamiento LittleFS ──────────────────────────────────
+  initStorage();
+
+  // ── GPS L76K: solo RX, UART2 ────────────────────────────────
+  GPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, -1);
+  Serial.println("[GPS] L76K iniciado — esperando señal...");
+
+  // ── Primera conexión MQTT ───────────────────────────────────
+  if (mqttConnect()) {
+    mqttConnected = true;
+  } else {
+    Serial.println("[MQTT] Conexión inicial fallida — se reintentará en loop");
+  }
+
+  Serial.println("[BOOT] Sistema listo");
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  LOOP
+// ═══════════════════════════════════════════════════════════════
+
+void loop() {
+  // Alimentar el parser GPS con todo byte disponible
+  while (GPS.available())
+    gps.encode(GPS.read());
+
+  // ── Log periódico de estado GPS ──────────────────────────────────
+  if (millis() - lastGpsLog >= GPS_LOG_INTERVAL) {
+    lastGpsLog = millis();
+    uint32_t chars = gps.charsProcessed();
+    if (chars == 0) {
+      Serial.println("[GPS] ⚠ 0 bytes NMEA recibidos — revisar cableado GPIO22 "
+                     "/ alimentación L76K");
+    } else {
+      bool fix =
+          gps.location.isValid() && gps.date.isValid() && gps.time.isValid();
+      uint8_t sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
+      float hdop = gps.hdop.isValid() ? gps.hdop.hdop() : 99.9f;
+      float speed = gps.speed.isValid() ? gps.speed.kmph() : 0.0f;
+      Serial.printf("[GPS] chars=%lu fix=%s sats=%u HDOP=%.1f spd=%.1f km/h",
+                    chars, fix ? "SI" : "NO", sats, hdop, speed);
+      if (fix)
+        Serial.printf(" lat=%.6f lon=%.6f", gps.location.lat(),
+                      gps.location.lng());
+      Serial.println();
+    }
+  }
+
+  // ── Procesar URCs acumulados durante comandos AT ──────────────
+  // (ya NO leer SerialAT directamente aquí)
+  if (urcPending.length() > 0) {
+    if (urcPending.indexOf("+CGEV: NW PDN DEACT") != -1 ||
+        urcPending.indexOf("+CMQTTNONET") != -1 ||
+        urcPending.indexOf("+CMQTTCONNLOST") != -1) {
+      Serial.print("[NET] URC: ");
+      Serial.print(urcPending);
+      mqttConnected = false;
+    }
+    urcPending = "";
+  }
+
+  // ── Leer URCs cuando el loop corre libre (sin comandos AT) ───
+  // Solo cuando no hay comandos AT en vuelo — es decir, aquí en
+  // el loop principal, no dentro de funciones que usen SerialAT
+  static String urcBuf;
+  while (SerialAT.available()) {
+    char c = SerialAT.read();
+    urcBuf += c;
+    if (c == '\n') {
+      if (urcBuf.indexOf("+CGEV: NW PDN DEACT") != -1 ||
+          urcBuf.indexOf("+CMQTTNONET") != -1 ||
+          urcBuf.indexOf("+CMQTTCONNLOST") != -1) {
+        Serial.print("[NET] URC (libre): ");
+        Serial.print(urcBuf);
+        mqttConnected = false;
+      }
+      urcBuf = "";
+    }
+    if (urcBuf.length() > 128)
+      urcBuf = "";
+  }
+
+  // En loop(), antes del bloque de reconexión MQTT:
+  if (millis() - lastModemCheck > MODEM_CHECK_INTERVAL) {
+    lastModemCheck = millis();
+    if (!modemIsAlive()) {
+      Serial.println("[WDT] Módem no responde en loop — reset");
+      mqttConnected = false;
+      hardResetModem();
+      sendAT("AT+CGDCONT=1,\"IP\",\"" NETWORK_APN "\"", "OK", 5000);
+      for (int i = 0; i < 3; i++) {
+        if (sendAT("AT+CGACT=1,1", "OK", 30000))
+          break;
+        delay(3000);
+      }
+    }
+  }
+
+  // ── Reconexión automática ────────────────────────────────────
+  if (!mqttConnected) {
+    if (millis() - lastReconnect > 45000UL) {
+      lastReconnect = millis();
+      Serial.println("[MQTT] Reconectando...");
+      if (mqttConnect()) {
+        mqttConnected = true;
+        lastReconnect = 0;
+        flushOfflineQueue(); // enviar lo acumulado al reconectar
+      }
+    }
+    return; // no publicar hasta tener conexión
+  }
+
+  // ── Flush periódico por si quedaron pendientes ───────────────
+  if (millis() - lastFlush > 60000UL) {
+    lastFlush = millis();
+    flushOfflineQueue();
+  }
+
+  // ── Publicar si el GPS tiene fix y se movió ≥ DISTANCE_MIN_M ───────
+  if (!gps.location.isValid() || !gps.date.isValid() || !gps.time.isValid()) {
+    emaReady = false; // resetear EMA si se pierde el fix
+    return;
+  }
+
+  double curLat = gps.location.lat();
+  double curLon = gps.location.lng();
+
+  // ── Actualizar EMA adaptativo ──────────────────────────────────────
+  // Alpha pequeño cuando estamos quietos = filtro muy agresivo
+  float gpsSpeed = gps.speed.isValid() ? gps.speed.kmph() : 0.0f;
+  float alpha =
+      (gpsSpeed >= MIN_SPEED_KMPH) ? EMA_ALPHA_MOVING : EMA_ALPHA_STILL;
+
+  if (!emaReady) {
+    smoothLat = curLat;
+    smoothLon = curLon;
+    emaReady = true;
+  } else {
+    smoothLat = alpha * curLat + (1.0f - alpha) * smoothLat;
+    smoothLon = alpha * curLon + (1.0f - alpha) * smoothLon;
+  }
+
+  // ── Hysteresis de velocidad ────────────────────────────────────────
+  // El vehículo entra en estado "moving" solo si mantiene velocidad
+  // suficiente durante MOVING_CONFIRM_COUNT lecturas consecutivas.
+  // Sale del estado al primer reporte de velocidad baja.
+  if (gpsSpeed >= MIN_SPEED_KMPH) {
+    if (movingConfirm < MOVING_CONFIRM_COUNT)
+      movingConfirm++;
+    if (movingConfirm >= MOVING_CONFIRM_COUNT)
+      isMovingState = true;
+  } else {
+    movingConfirm = 0;
+    isMovingState = false; // sale inmediatamente al detenerse
+  }
+
+  // ── Distancia desde última publicación ────────────────────────────
+  double dist = hasLastPos ? TinyGPSPlus::distanceBetween(lastLat, lastLon,
+                                                          smoothLat, smoothLon)
+                           : DISTANCE_MIN_M;
+
+  // ── Cooldown entre publicaciones ──────────────────────────────────
+  bool cooldownOk = (millis() - lastPubMs) >= PUB_COOLDOWN_MS;
+
+  // ── Condición 1: en movimiento (velocidad + distancia + cooldown) ──
+  if (isMovingState && dist >= DISTANCE_MIN_M && cooldownOk) {
+    if (buildAndPublish()) {
+      lastLat = smoothLat;
+      lastLon = smoothLon;
+      hasLastPos = true;
+      lastPubMs = millis();
+      lastHeartbeat = millis(); // reiniciar heartbeat también
+    }
+    return;
+  }
+
+  // ── Condición 2: heartbeat estacionario (fix válido + tiempo) ─────
+  // Publica aunque el vehículo esté detenido para confirmar que el
+  // tracker sigue activo y reportar su última posición conocida.
+  if ((millis() - lastHeartbeat) >= STATIONARY_HEARTBEAT_MS) {
+    Serial.println("[GPS] Heartbeat estacionario");
+    if (buildAndPublish()) {
+      lastHeartbeat = millis();
+      lastPubMs = millis();
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  INFORMACIÓN SIM + RED CELULAR
+// ═══════════════════════════════════════════════════════════════
+
+void diagSIMNetwork() {
+
+  Serial.println();
+  Serial.println("══════════════════════════════════════");
+  Serial.println("      DIAGNÓSTICO SIM / RED LTE");
+  Serial.println("══════════════════════════════════════");
+
+  struct ATQuery {
+    const char *name;
+    const char *cmd;
+  };
+
+  ATQuery queries[] = {
+
+      {"ICCID SIM", "AT+CICCID"},    {"IMSI SIM", "AT+CIMI"},
+      {"OPERADOR", "AT+COPS?"},      {"ESTADO SIM", "AT+CPIN?"},
+      {"CALIDAD RSSI", "AT+CSQ"},    {"CALIDAD EXTENDIDA", "AT+CESQ"},
+      {"REGISTRO GSM", "AT+CREG?"},  {"REGISTRO GPRS", "AT+CGREG?"},
+      {"REGISTRO LTE", "AT+CEREG?"}, {"APN", "AT+CGDCONT?"},
+      {"IP", "AT+CGPADDR=1"},        {"PDP", "AT+CGACT?"},
+      {"RED", "AT+CPSI?"},           {"PING", "AT+CDNSGIP=\"google.com\""},
+      {"IPv", "AT+CGPADDR=1"},       {"RESTRICC", "AT+COPS?"},
+      {"RESTRIC2", "AT+CPSI?"}
+
+  };
+
+  for (auto &q : queries) {
+
+    Serial.println();
+    Serial.print("[");
+    Serial.print(q.name);
+    Serial.println("]");
+
+    String response = sendATStr(q.cmd, 5000);
+
+    Serial.println(response);
+
+    delay(300);
+  }
+
+  Serial.println();
+  Serial.println("══════════════════════════════════════");
+  Serial.println(" FIN DIAGNÓSTICO SIM / RED");
+  Serial.println("══════════════════════════════════════");
+}
