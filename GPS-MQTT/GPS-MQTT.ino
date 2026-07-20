@@ -1,9 +1,23 @@
 /*
-  GPS-MQTT.ino  —  Tracker GPS L76K + MQTT Nativo (A7670G)
-  ──────────────────────────────────────────────────────────
+  GPS-MQTT.ino  —  Tracker GPS L76K + MQTT Nativo (A7670G)  v2 (OTA)
+  ──────────────────────────────────────────────────────────────────
   Lee posición del GPS Quectel L76K via TinyGPS++,
   construye el mismo JSON que publica el rx.ino y lo envía
   por MQTT nativo del módem A7670G (AT+CMQTT*).
+
+  ── OTA (Over-The-Air) ──────────────────────────────────────────
+  Escucha el topic MQTT:
+    tracker/cmd/ota/<DEVICE_ID>
+  Payload JSON:
+    {"token":"<secret>","version":"1.1","url":"https://github.com/..."}
+
+  Seguridad:
+    1. Token secreto almacenado en NVS (Preferences) — REQUERIDO.
+    2. URL debe comenzar con "https://".
+    3. TLS verificado por el módem A7670G.
+
+  Estado OTA publicado en:
+    tracker/status/ota/<DEVICE_ID>
 
   JSON publicado (igual que publishPacket() en rx.ino):
     {
@@ -24,8 +38,20 @@
   GPS:        Quectel L76K (solo RX, pin GPIO 22)
 */
 
+#include <Preferences.h>
+#include <Update.h>
+
+// ─── Versión de firmware ────────────────────────────────────────
+#define FIRMWARE_VERSION "2.0"
+
+// ─── OTA automático al arrancar ─────────────────────────────────
+// URL de un JSON estático con la versión disponible. Formato:
+//   {"version":"2.1","url":"https://example.com/firmware.bin"}
+// Dejar vacío ("") para deshabilitar la verificación automática.
+#define OTA_VERSION_URL "https://raw.githubusercontent.com/vmaldonadoz/Car-Tracker/main/version.json"
+
 // ─── Identificación del dispositivo ────────────────────────────
-#define DEVICE_ID 1
+#define DEVICE_ID 4
 
 // ─── SIM y APN ─────────────────────────────────────────────────
 #define SIM_PIN "" // dejar vacío si la SIM no tiene PIN
@@ -57,6 +83,17 @@ const int port = 4033;
 
 // ─── ID de esta estación (equivale a stationId del rx) ────────
 #define STATION_ID "hoatzin"
+
+// ─── Topics OTA ────────────────────────────────────────────────
+// Escucha:  tracker/cmd/ota/<DEVICE_ID>
+//   payload: {"token":"...","version":"1.1","url":"https://..."}
+// Publica:  tracker/status/ota/<DEVICE_ID>
+#define OTA_CMD_TOPIC_PREFIX "tracker/cmd/ota/"
+#define OTA_STATUS_TOPIC_PREFIX "tracker/status/ota/"
+
+// ─── Token OTA por defecto (NVS sobreescribe si existe) ────────
+// Mínimo 8 caracteres. Dejar vacío fuerza configuración via NVS.
+#define OTA_TOKEN_DEFAULT ""
 
 // ─── Umbrales de movimiento real ─────────────────────────────────────
 #define DISTANCE_MIN_M 15.0f // metros mínimos entre publicaciones en movimiento
@@ -141,6 +178,48 @@ uint32_t lastPubMs = 0;     // timestamp de última publicación
 // ─── Buffer de URCs asíncronos ────────────────────────────────
 static String urcPending = ""; // URCs recibidos durante comandos AT
 
+// ─── Token OTA (cargado desde NVS en setup) ───────────────────
+static char otaToken[64] = OTA_TOKEN_DEFAULT;
+
+// ─── Bandera OTA pendiente (procesada en loop, no dentro de ISR/AT) ──
+static volatile bool otaPending = false;
+static String otaVersion = "";
+static String otaUrl = "";
+
+// ═══════════════════════════════════════════════════════════════
+//  NVS — carga / guarda token OTA
+// ═══════════════════════════════════════════════════════════════
+
+void loadOtaToken() {
+  Preferences prefs;
+  prefs.begin("gps_cfg", true);
+  if (prefs.isKey("otatk")) {
+    String tk = prefs.getString("otatk", "");
+    strlcpy(otaToken, tk.c_str(), sizeof(otaToken));
+  }
+  prefs.end();
+  if (strlen(otaToken) < 8) {
+    Serial.println(
+        "[SEC] *** ADVERTENCIA: Token OTA no configurado — OTA bloqueado ***");
+    Serial.println(
+        "[SEC]     Configura el token via: saveOtaToken(\"mi_token\")");
+  } else {
+    Serial.println("[SEC] Token OTA cargado desde NVS OK");
+  }
+}
+
+// Llama esta función una vez para guardar el token en NVS.
+// Ejemplo de uso desde setup() (solo la primera vez):
+//   saveOtaToken("mi_token_secreto");
+void saveOtaToken(const char *token) {
+  Preferences prefs;
+  prefs.begin("gps_cfg", false);
+  prefs.putString("otatk", token);
+  prefs.end();
+  strlcpy(otaToken, token, sizeof(otaToken));
+  Serial.printf("[SEC] Token OTA guardado en NVS (%u chars)\n", strlen(token));
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  HELPERS AT  (extraídos del MQTT.ino de referencia)
 // ═══════════════════════════════════════════════════════════════
@@ -165,6 +244,10 @@ bool sendAT(const String &cmd, const String &expected = "OK",
         if (buf.indexOf("+CGEV: NW PDN DEACT") != -1 ||
             buf.indexOf("+CMQTTNONET") != -1 ||
             buf.indexOf("+CMQTTCONNLOST") != -1) {
+          urcPending += buf;
+        }
+        // ── Detectar mensaje MQTT entrante ───────────────────
+        if (buf.indexOf("+CMQTTRXSTART") != -1) {
           urcPending += buf;
         }
       }
@@ -192,7 +275,11 @@ String sendATStr(const String &cmd, uint32_t ms = 5000) {
         if (buf.indexOf("+CGEV: NW PDN DEACT") != -1 ||
             buf.indexOf("+CMQTTNONET") != -1 ||
             buf.indexOf("+CMQTTCONNLOST") != -1) {
-          urcPending += buf; // guardar para procesar en loop()
+          urcPending += buf;
+        }
+        // ── Detectar mensaje MQTT entrante ───────────────────
+        if (buf.indexOf("+CMQTTRXSTART") != -1) {
+          urcPending += buf;
         }
       }
     }
@@ -670,8 +757,691 @@ bool mqttConnect() {
   }
 
   Serial.println("[MQTT] Conectado OK");
-  delay(1000);
+  delay(500);
+
+  // ── Suscribir al topic OTA ─────────────────────────────────
+  char otaTopic[64];
+  snprintf(otaTopic, sizeof(otaTopic), "%s%u", OTA_CMD_TOPIC_PREFIX, DEVICE_ID);
+
+  // AT+CMQTTSUBTOPIC=<index>,<len>,<qos>
+  flushModem();
+  SerialAT.println("AT+CMQTTSUBTOPIC=0," + String(strlen(otaTopic)) + ",1");
+  if (waitPromptAndSend((const uint8_t *)otaTopic, strlen(otaTopic))) {
+    delay(200);
+    // AT+CMQTTSUB=<index>,<timeout>
+    String subResult = sendATStr("AT+CMQTTSUB=0,10", 12000);
+    if (subResult.indexOf("+CMQTTSUB: 0,0") != -1) {
+      Serial.printf("[MQTT] Suscrito a OTA topic: %s\n", otaTopic);
+    } else {
+      Serial.printf("[MQTT] Fallo subscribe OTA: %s\n", subResult.c_str());
+    }
+  } else {
+    Serial.println("[MQTT] Fallo enviando OTA topic para subscribe");
+  }
+
+  Serial.printf("[MQTT] Firmware v%s listo\n", FIRMWARE_VERSION);
+  delay(500);
   return true;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  OTA — descarga via AT+CHTTPS* del módem A7670G
+// ═══════════════════════════════════════════════════════════════
+
+// Publica el estado OTA en tracker/status/ota/<DEVICE_ID>
+void publishOtaStatus(const char *json) {
+  char topic[64];
+  snprintf(topic, sizeof(topic), "%s%u", OTA_STATUS_TOPIC_PREFIX, DEVICE_ID);
+  mqttPublishText(topic, json, /*qos=*/0, /*retain=*/0);
+  Serial.printf("[OTA] Status: %s\n", json);
+}
+
+/*
+  Parsea "https://hostname/path" separando host y path.
+  Retorna false si no es https:// o el formato es inválido.
+*/
+bool parseHttpsUrl(const String &url, String &host, String &path) {
+  if (!url.startsWith("https://"))
+    return false;
+  String rest = url.substring(8); // quitar "https://"
+  int slashPos = rest.indexOf('/');
+  if (slashPos < 0) {
+    host = rest;
+    path = "/";
+  } else {
+    host = rest.substring(0, slashPos);
+    path = rest.substring(slashPos);
+  }
+  return host.length() > 0;
+}
+
+/*
+  doOTA:
+    Descarga el firmware desde 'url' (debe ser https://) usando los
+    comandos AT+CHTTPS* del módem A7670G y lo escribe en la partición
+    OTA del ESP32 con la API Update.h.
+
+  Flujo AT:
+    1. AT+CHTTPSINIT           → inicia stack HTTPS del módem
+    2. AT+CHTTPSOPSE           → abre conexión TLS al servidor
+    3. AT+CHTTPSHEAD           → envía petición GET
+    4. AT+CHTTPSRECV=0,<n>     → lee bloques de bytes
+       → repetir hasta totalSize
+    5. AT+CHTTPSCLSE=0         → cierra conexión
+    6. AT+CHTTPSNULL           → libera stack HTTPS
+*/
+void doOTA(const String &version, const String &url) {
+  Serial.println("\n[OTA] ========== INICIANDO OTA ==========");
+  Serial.printf("[OTA] Actual: %s  Nueva: %s\n", FIRMWARE_VERSION,
+                version.c_str());
+  Serial.printf("[OTA] URL: %s\n", url.c_str());
+
+  if (version == FIRMWARE_VERSION) {
+    publishOtaStatus("{\"info\":\"ya_tengo_esta_version\"}");
+    return;
+  }
+
+  String host, path;
+  if (!parseHttpsUrl(url, host, path)) {
+    publishOtaStatus("{\"error\":\"url_invalida\"}");
+    return;
+  }
+  Serial.printf("[OTA] Host: %s  Path: %s\n", host.c_str(), path.c_str());
+
+  publishOtaStatus(
+      ("{\"status\":\"descargando\",\"target\":\"" + version + "\"}").c_str());
+  delay(300);
+
+  // ── 1. Iniciar stack HTTPS ────────────────────────────────────
+  sendAT("AT+CHTTPSINIT", "OK", 5000);
+  delay(300);
+
+  // ── 2. Abrir conexión TLS al servidor (puerto 443) ──────────
+  // AT+CHTTPSOPSE="<host>",<port>,<ssl_type>
+  //   ssl_type: 1 = TLS (sin verificar CA) ; 2 = TLS (verificar CA)
+  //   Usamos 1 para compatibilidad con GitHub/S3 sin cargar certificados.
+  String openCmd = "AT+CHTTPSOPSE=\"" + host + "\",443,1";
+  if (!sendAT(openCmd, "+CHTTPSOPSE: 0", 30000)) {
+    Serial.println("[OTA] Fallo abriendo conexión HTTPS");
+    publishOtaStatus("{\"error\":\"https_open_fail\"}");
+    sendAT("AT+CHTTPSNULL", "OK", 5000);
+    return;
+  }
+  delay(300);
+
+  // ── 3. Enviar petición GET ───────────────────────────────────
+  // AT+CHTTPSHEAD=<index>,<len>  → prompt '>' → enviamos la cabecera HTTP
+  String httpReq = "GET " + path + " HTTP/1.1\r\n";
+  httpReq += "Host: " + host + "\r\n";
+  httpReq += "User-Agent: ESP32-OTA/2.0\r\n";
+  httpReq += "Connection: close\r\n";
+  httpReq += "\r\n";
+
+  flushModem();
+  SerialAT.println("AT+CHTTPSHEAD=0," + String(httpReq.length()));
+  if (!waitPromptAndSend((const uint8_t *)httpReq.c_str(), httpReq.length(),
+                         10000)) {
+    Serial.println("[OTA] Fallo enviando cabecera GET");
+    publishOtaStatus("{\"error\":\"https_head_fail\"}");
+    sendAT("AT+CHTTPSCLSE=0", "OK", 5000);
+    sendAT("AT+CHTTPSNULL", "OK", 5000);
+    return;
+  }
+  delay(500);
+
+  // ── 4. Leer la respuesta HTTP ────────────────────────────────
+  // Primero leemos la cabecera de respuesta para obtener Content-Length
+  // y el código HTTP (200 = OK, 302 = redirect, etc.)
+  // Leer los primeros bytes para encontrar la cabecera
+
+  int32_t totalSize = -1;  // Content-Length
+  bool headerDone = false; // pasamos la línea vacía \r\n\r\n
+  String headerBuf = "";
+  int32_t written = 0;
+  bool updateStarted = false;
+  bool otaSuccess = false;
+
+  // Buffer de lectura en bloques de 512 bytes por AT+CHTTPSRECV
+  const int RECV_BLOCK = 512;
+
+  Serial.println("[OTA] Leyendo respuesta HTTP...");
+
+  // Leer en un loop hasta que el servidor cierre la conexión
+  // o hayamos escrito totalSize bytes
+  uint32_t otaTimeout = millis();
+  const uint32_t OTA_MAX_MS = 180000UL; // 3 minutos máximo
+
+  while (millis() - otaTimeout < OTA_MAX_MS) {
+    // Solicitar un bloque al módem
+    flushModem();
+    SerialAT.println("AT+CHTTPSRECV=0," + String(RECV_BLOCK));
+
+    // El módem responde con:
+    //   +CHTTPSRECV: DATA,<len>
+    //   <bytes raw>
+    //   OK
+    // o "+CHTTPSRECV: 0" cuando no hay más datos.
+
+    String recvHeader = "";
+    uint32_t t0 = millis();
+    bool gotData = false;
+
+    while (millis() - t0 < 10000) {
+      while (SerialAT.available()) {
+        char c = SerialAT.read();
+        recvHeader += c;
+
+        // Buscar la cabecera de datos "+CHTTPSRECV: DATA,<len>"
+        if (!gotData && recvHeader.indexOf("+CHTTPSRECV: DATA,") != -1) {
+          // Parsear la longitud
+          int idx = recvHeader.indexOf("+CHTTPSRECV: DATA,");
+          int endIdx = recvHeader.indexOf('\n', idx);
+          if (endIdx == -1)
+            continue;
+          String lenStr = recvHeader.substring(idx + 18, endIdx);
+          lenStr.trim();
+          int dataLen = lenStr.toInt();
+          if (dataLen <= 0)
+            break;
+
+          gotData = true;
+
+          // Leer exactamente dataLen bytes de la UART
+          uint8_t rawBuf[RECV_BLOCK + 32];
+          int received = 0;
+          uint32_t t1 = millis();
+          while (received < dataLen && millis() - t1 < 10000) {
+            if (SerialAT.available()) {
+              rawBuf[received++] = SerialAT.read();
+            }
+          }
+
+          if (!headerDone) {
+            // Acumular en headerBuf para parsear cabecera HTTP
+            for (int i = 0; i < received; i++)
+              headerBuf += (char)rawBuf[i];
+
+            // Buscar fin de cabecera HTTP (\r\n\r\n)
+            int headerEnd = headerBuf.indexOf("\r\n\r\n");
+            if (headerEnd != -1) {
+              headerDone = true;
+
+              // Parsear código HTTP (línea 1: "HTTP/1.1 200 OK")
+              int codeStart = headerBuf.indexOf("HTTP/1.1 ");
+              if (codeStart == -1)
+                codeStart = headerBuf.indexOf("HTTP/1.0 ");
+              int httpCode = 0;
+              if (codeStart != -1) {
+                httpCode =
+                    headerBuf.substring(codeStart + 9, codeStart + 12).toInt();
+              }
+              Serial.printf("[OTA] HTTP Code: %d\n", httpCode);
+
+              if (httpCode == 301 || httpCode == 302) {
+                // GitHub usa 302 para redirigir a la descarga real
+                // Extraer Location header
+                int locIdx = headerBuf.indexOf("Location: ");
+                if (locIdx == -1)
+                  locIdx = headerBuf.indexOf("location: ");
+                if (locIdx != -1) {
+                  int locEnd = headerBuf.indexOf('\n', locIdx);
+                  String location = headerBuf.substring(locIdx + 10, locEnd);
+                  location.trim();
+                  Serial.printf("[OTA] Redirect → %s\n", location.c_str());
+                  // Guardar la nueva URL y reintentar en el loop principal
+                  otaVersion = version;
+                  otaUrl = location;
+                  otaPending = true;
+                }
+                publishOtaStatus(
+                    "{\"error\":\"redirect_no_soportado_directamente\"}");
+                sendAT("AT+CHTTPSCLSE=0", "OK", 5000);
+                sendAT("AT+CHTTPSNULL", "OK", 5000);
+                return;
+              }
+
+              if (httpCode != 200) {
+                Serial.printf("[OTA] HTTP Error %d\n", httpCode);
+                char errBuf[48];
+                snprintf(errBuf, sizeof(errBuf), "{\"error\":\"http_%d\"}",
+                         httpCode);
+                publishOtaStatus(errBuf);
+                sendAT("AT+CHTTPSCLSE=0", "OK", 5000);
+                sendAT("AT+CHTTPSNULL", "OK", 5000);
+                return;
+              }
+
+              // Parsear Content-Length
+              int clIdx = headerBuf.indexOf("Content-Length: ");
+              if (clIdx == -1)
+                clIdx = headerBuf.indexOf("content-length: ");
+              if (clIdx != -1) {
+                int clEnd = headerBuf.indexOf('\n', clIdx);
+                String clStr = headerBuf.substring(clIdx + 16, clEnd);
+                clStr.trim();
+                totalSize = clStr.toInt();
+                Serial.printf("[OTA] Content-Length: %d bytes\n", totalSize);
+              }
+
+              // Iniciar partición OTA
+              if (!Update.begin(totalSize > 0 ? totalSize
+                                              : UPDATE_SIZE_UNKNOWN)) {
+                Update.printError(Serial);
+                publishOtaStatus("{\"error\":\"no_space\"}");
+                sendAT("AT+CHTTPSCLSE=0", "OK", 5000);
+                sendAT("AT+CHTTPSNULL", "OK", 5000);
+                return;
+              }
+              updateStarted = true;
+              Serial.println("[OTA] Update.begin() OK — escribiendo...");
+
+              // Escribir el cuerpo que ya llegó en este bloque
+              int bodyStart = headerEnd + 4;
+              int bodyLen = received - bodyStart;
+              if (bodyLen > 0) {
+                written += Update.write(rawBuf + bodyStart, bodyLen);
+              }
+            }
+            // Si aún no encontramos el fin de cabecera, seguir acumulando
+          } else {
+            // Ya pasamos la cabecera → escribir directamente en flash
+            if (updateStarted && received > 0) {
+              written += Update.write(rawBuf, received);
+              Serial.printf("[OTA] %d / %d bytes (%.0f%%)\r", written,
+                            totalSize,
+                            totalSize > 0 ? (written * 100.0 / totalSize) : 0);
+            }
+          }
+          break; // salir del bucle de lectura de UART
+        }
+
+        // "+CHTTPSRECV: 0" → no hay más datos disponibles aún
+        if (recvHeader.indexOf("+CHTTPSRECV: 0") != -1) {
+          // Verificar si la conexión ya se cerró
+          if (recvHeader.indexOf("+CHTTPSCLSE") != -1 ||
+              (totalSize > 0 && written >= totalSize)) {
+            goto ota_done;
+          }
+          delay(200);
+          break;
+        }
+
+        // "+CHTTPSCLSE" URC → servidor cerró la conexión
+        if (recvHeader.indexOf("+CHTTPSCLSE") != -1) {
+          goto ota_done;
+        }
+      }
+
+      if (gotData)
+        break;
+    }
+
+    // Verificar si ya descargamos todo
+    if (totalSize > 0 && written >= totalSize)
+      break;
+
+    delay(50);
+  }
+
+ota_done:
+  Serial.println();
+  Serial.printf("[OTA] Descargados: %d / %d bytes\n", written, totalSize);
+
+  // ── 5. Cerrar conexión ──────────────────────────────────────
+  sendAT("AT+CHTTPSCLSE=0", "OK", 5000);
+  sendAT("AT+CHTTPSNULL", "OK", 5000);
+
+  if (!updateStarted) {
+    publishOtaStatus("{\"error\":\"update_no_iniciado\"}");
+    return;
+  }
+
+  // ── 6. Finalizar y reiniciar ────────────────────────────────
+  if (Update.end() && Update.isFinished()) {
+    char okBuf[64];
+    snprintf(okBuf, sizeof(okBuf), "{\"status\":\"ok\",\"version\":\"%s\"}",
+             version.c_str());
+    publishOtaStatus(okBuf);
+    Serial.println("[OTA] ✓ OK — reiniciando en 2 s...");
+    delay(2000);
+    ESP.restart();
+  } else {
+    publishOtaStatus("{\"error\":\"update_incompleto\"}");
+    Update.printError(Serial);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  OTA AUTOMÁTICO AL ARRANCAR — verifica servidor de versiones
+// ═══════════════════════════════════════════════════════════════
+
+/*
+  checkOtaOnBoot:
+    Al inicio, descarga un JSON estático desde OTA_VERSION_URL y
+    compara el campo "version" con FIRMWARE_VERSION.
+    Si son distintos, llama a doOTA() con la URL del firmware.
+
+    Formato esperado del JSON en el servidor:
+      {"version":"2.1","url":"https://example.com/firmware.bin"}
+
+    Seguridad:
+      - La URL del manifiesto DEBE ser https://
+      - La URL del firmware dentro del JSON también debe ser https://
+      - No se requiere token (es el dispositivo quien consulta,
+        no un comando externo)
+
+    Llama esta función desde setup() DESPUÉS de mqttConnect().
+*/
+void checkOtaOnBoot() {
+  if (strlen(OTA_VERSION_URL) == 0) {
+    Serial.println("[OTA-BOOT] Sin URL de versión configurada — omitiendo");
+    return;
+  }
+
+  String manifestUrl = String(OTA_VERSION_URL);
+  if (!manifestUrl.startsWith("https://")) {
+    Serial.println("[OTA-BOOT] OTA_VERSION_URL debe ser https:// — omitiendo");
+    return;
+  }
+
+  Serial.println("[OTA-BOOT] Consultando servidor de versiones...");
+  Serial.printf("[OTA-BOOT] URL: %s\n", manifestUrl.c_str());
+
+  String host, path;
+  if (!parseHttpsUrl(manifestUrl, host, path)) {
+    Serial.println("[OTA-BOOT] URL de manifiesto inválida");
+    return;
+  }
+
+  // ── Iniciar stack HTTPS ────────────────────────────────────────
+  sendAT("AT+CHTTPSINIT", "OK", 5000);
+  delay(300);
+
+  String openCmd = "AT+CHTTPSOPSE=\"" + host + "\",443,1";
+  if (!sendAT(openCmd, "+CHTTPSOPSE: 0", 30000)) {
+    Serial.println("[OTA-BOOT] No se pudo conectar al servidor de versiones");
+    sendAT("AT+CHTTPSNULL", "OK", 5000);
+    return;
+  }
+  delay(300);
+
+  // ── Petición GET al manifiesto ─────────────────────────────────
+  String httpReq = "GET " + path + " HTTP/1.1\r\n";
+  httpReq += "Host: " + host + "\r\n";
+  httpReq += "User-Agent: ESP32-OTA/2.0\r\n";
+  httpReq += "Connection: close\r\n";
+  httpReq += "\r\n";
+
+  flushModem();
+  SerialAT.println("AT+CHTTPSHEAD=0," + String(httpReq.length()));
+  if (!waitPromptAndSend((const uint8_t *)httpReq.c_str(), httpReq.length(), 10000)) {
+    Serial.println("[OTA-BOOT] Fallo enviando petición GET");
+    sendAT("AT+CHTTPSCLSE=0", "OK", 5000);
+    sendAT("AT+CHTTPSNULL", "OK", 5000);
+    return;
+  }
+  delay(500);
+
+  // ── Leer respuesta (máx 2 KB — el manifiesto es pequeño) ───────
+  String responseBuf = "";
+  const int MANIFEST_BLOCK = 512;
+  uint32_t t0 = millis();
+  bool done = false;
+
+  while (!done && millis() - t0 < 20000) {
+    flushModem();
+    SerialAT.println("AT+CHTTPSRECV=0," + String(MANIFEST_BLOCK));
+
+    String recvHdr = "";
+    uint32_t t1 = millis();
+    bool gotBlock = false;
+
+    while (millis() - t1 < 8000) {
+      while (SerialAT.available()) {
+        char c = SerialAT.read();
+        recvHdr += c;
+
+        if (!gotBlock && recvHdr.indexOf("+CHTTPSRECV: DATA,") != -1) {
+          int idx = recvHdr.indexOf("+CHTTPSRECV: DATA,");
+          int eol = recvHdr.indexOf('\n', idx);
+          if (eol == -1) continue;
+          int dataLen = recvHdr.substring(idx + 18, eol).toInt();
+          if (dataLen <= 0) { done = true; break; }
+
+          gotBlock = true;
+          uint8_t tmp[MANIFEST_BLOCK + 32];
+          int rx = 0;
+          uint32_t t2 = millis();
+          while (rx < dataLen && millis() - t2 < 8000) {
+            if (SerialAT.available())
+              tmp[rx++] = SerialAT.read();
+          }
+          responseBuf += String((char *)tmp).substring(0, rx);
+
+          // Dejar de leer si ya tenemos suficiente (2 KB máx)
+          if (responseBuf.length() >= 2048) done = true;
+          break;
+        }
+
+        if (recvHdr.indexOf("+CHTTPSRECV: 0") != -1 ||
+            recvHdr.indexOf("+CHTTPSCLSE") != -1) {
+          done = true;
+          break;
+        }
+      }
+      if (gotBlock || done) break;
+    }
+    if (!gotBlock) done = true;
+    delay(50);
+  }
+
+  sendAT("AT+CHTTPSCLSE=0", "OK", 5000);
+  sendAT("AT+CHTTPSNULL", "OK", 5000);
+
+  // ── Extraer cuerpo JSON (tras \r\n\r\n) ────────────────────────
+  int bodyStart = responseBuf.indexOf("\r\n\r\n");
+  String jsonBody = (bodyStart != -1)
+                      ? responseBuf.substring(bodyStart + 4)
+                      : responseBuf;
+  jsonBody.trim();
+
+  Serial.printf("[OTA-BOOT] Respuesta del servidor: %s\n", jsonBody.c_str());
+
+  // ── Parsear version y url del JSON ────────────────────────────
+  auto extractField = [](const String &json, const String &key) -> String {
+    String search = "\"" + key + "\":\"";
+    int idx = json.indexOf(search);
+    if (idx == -1) return "";
+    idx += search.length();
+    int end = json.indexOf("\"", idx);
+    if (end == -1) return "";
+    return json.substring(idx, end);
+  };
+
+  String remoteVersion = extractField(jsonBody, "version");
+  String remoteUrl     = extractField(jsonBody, "url");
+
+  if (remoteVersion.length() == 0 || remoteUrl.length() == 0) {
+    Serial.println("[OTA-BOOT] Manifiesto inválido (faltan version o url)");
+    return;
+  }
+
+  Serial.printf("[OTA-BOOT] Versión local: %s  —  Versión remota: %s\n",
+                FIRMWARE_VERSION, remoteVersion.c_str());
+
+  if (remoteVersion == FIRMWARE_VERSION) {
+    Serial.println("[OTA-BOOT] Firmware actualizado. No hay nada que hacer.");
+    return;
+  }
+
+  if (!remoteUrl.startsWith("https://")) {
+    Serial.println("[OTA-BOOT] URL del firmware no es https:// — abortando");
+    return;
+  }
+
+  Serial.printf("[OTA-BOOT] *** Nueva versión disponible: %s → actualizando ***\n",
+                remoteVersion.c_str());
+
+  // Publicar estado si MQTT está conectado
+  if (mqttConnected) {
+    String statusMsg = "{\"status\":\"auto_ota_inicio\",\"desde\":\""
+                       + String(FIRMWARE_VERSION) + "\",\"hacia\":\""
+                       + remoteVersion + "\"}";
+    publishOtaStatus(statusMsg.c_str());
+    delay(300);
+  }
+
+  doOTA(remoteVersion, remoteUrl);
+}
+
+/*
+  handleOtaCommand:
+    Parsea el payload JSON del mensaje MQTT OTA (sin librería JSON).
+    Formato esperado: {"token":"...","version":"...","url":"https://..."}
+
+    Seguridad:
+      1. Token secreto — verifica contra NVS.
+      2. URL debe comenzar en https://.
+*/
+void handleOtaCommand(const String &payload) {
+  Serial.printf("[OTA] Comando recibido: %s\n", payload.c_str());
+
+  // ── Capa 1: token obligatorio ────────────────────────────────
+  if (strlen(otaToken) < 8) {
+    Serial.println("[SEC] OTA rechazado: token no configurado");
+    publishOtaStatus("{\"error\":\"token_no_configurado\"}");
+    return;
+  }
+
+  // Extraer campo "token" del JSON a mano
+  // Buscamos: "token":"<valor>"
+  auto extractField = [](const String &json, const String &key) -> String {
+    String search = "\"" + key + "\":\"";
+    int idx = json.indexOf(search);
+    if (idx == -1)
+      return "";
+    idx += search.length();
+    int end = json.indexOf("\"", idx);
+    if (end == -1)
+      return "";
+    return json.substring(idx, end);
+  };
+
+  String token = extractField(payload, "token");
+  String version = extractField(payload, "version");
+  String url = extractField(payload, "url");
+
+  if (token != String(otaToken)) {
+    Serial.println("[SEC] OTA rechazado: token inválido");
+    publishOtaStatus("{\"error\":\"token_invalido\"}");
+    return;
+  }
+
+  if (version.length() == 0 || url.length() == 0) {
+    Serial.println("[OTA] Payload incompleto (version o url faltante)");
+    publishOtaStatus("{\"error\":\"payload_incompleto\"}");
+    return;
+  }
+
+  // ── Capa 2: URL debe ser HTTPS ───────────────────────────────
+  if (!url.startsWith("https://")) {
+    Serial.println("[SEC] OTA rechazado: URL no es HTTPS");
+    publishOtaStatus("{\"error\":\"url_no_https\"}");
+    return;
+  }
+
+  Serial.printf("[OTA] Token OK. Versión objetivo: %s\n", version.c_str());
+  doOTA(version, url);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  MANEJO DE MENSAJES MQTT ENTRANTES (URC +CMQTTRXSTART)
+// ═══════════════════════════════════════════════════════════════
+
+/*
+  processIncomingMqtt:
+    Llamada desde loop() cuando se detecta el URC "+CMQTTRXSTART".
+    Lee el topic y payload del mensaje usando AT+CMQTTRXTOPIC y
+    AT+CMQTTRXPAYLOAD, luego despacha al handler correspondiente.
+
+  Flujo AT para recibir un mensaje MQTT:
+    Cuando llega un mensaje, el módem emite una secuencia de URCs:
+      +CMQTTRXSTART: <index>,<topicLen>,<payloadLen>
+      +CMQTTRXTOPIC: <index>,<topicLen>
+      <topic>
+      +CMQTTRXPAYLOAD: <index>,<payloadLen>
+      <payload>
+      +CMQTTRXEND: <index>
+*/
+void processIncomingMqtt() {
+  // Leer todo lo que haya en el buffer de la UART (el URC puede estar
+  // parcialmente en urcPending; leer el resto directamente)
+  String fullBuf = urcPending;
+
+  // Leer bytes adicionales con timeout corto
+  uint32_t t0 = millis();
+  while (millis() - t0 < 3000) {
+    while (SerialAT.available()) {
+      fullBuf += (char)SerialAT.read();
+      t0 = millis(); // resetear timeout mientras llegan datos
+    }
+    if (fullBuf.indexOf("+CMQTTRXEND") != -1)
+      break;
+    delay(20);
+  }
+
+  Serial.println("[MQTT-RX] URC completo recibido");
+
+  // ── Extraer topic ─────────────────────────────────────────────
+  // El topic viene después de "+CMQTTRXTOPIC: <index>,<len>\r\n"
+  String topic = "";
+  int topicUrcIdx = fullBuf.indexOf("+CMQTTRXTOPIC:");
+  if (topicUrcIdx != -1) {
+    int topicLineEnd = fullBuf.indexOf('\n', topicUrcIdx);
+    if (topicLineEnd != -1) {
+      // El topic raw está en la siguiente línea
+      int topicStart = topicLineEnd + 1;
+      int topicEnd = fullBuf.indexOf('\n', topicStart);
+      if (topicEnd == -1)
+        topicEnd = fullBuf.length();
+      topic = fullBuf.substring(topicStart, topicEnd);
+      topic.trim();
+    }
+  }
+
+  // ── Extraer payload ───────────────────────────────────────────
+  String payload = "";
+  int payloadUrcIdx = fullBuf.indexOf("+CMQTTRXPAYLOAD:");
+  if (payloadUrcIdx != -1) {
+    int payloadLineEnd = fullBuf.indexOf('\n', payloadUrcIdx);
+    if (payloadLineEnd != -1) {
+      int payloadStart = payloadLineEnd + 1;
+      int payloadEnd = fullBuf.indexOf("+CMQTTRXEND", payloadStart);
+      if (payloadEnd == -1)
+        payloadEnd = fullBuf.length();
+      payload = fullBuf.substring(payloadStart, payloadEnd);
+      payload.trim();
+    }
+  }
+
+  if (topic.length() == 0) {
+    Serial.println("[MQTT-RX] Topic vacío — descartado");
+    return;
+  }
+
+  Serial.printf("[MQTT-RX] Topic: %s\n", topic.c_str());
+  Serial.printf("[MQTT-RX] Payload: %s\n", payload.c_str());
+
+  // ── Dispatch ──────────────────────────────────────────────────
+  char otaTopic[64];
+  snprintf(otaTopic, sizeof(otaTopic), "%s%u", OTA_CMD_TOPIC_PREFIX, DEVICE_ID);
+
+  if (topic == String(otaTopic)) {
+    handleOtaCommand(payload);
+    return;
+  }
+
+  Serial.printf("[MQTT-RX] Topic desconocido: %s\n", topic.c_str());
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -945,11 +1715,20 @@ bool buildAndPublish() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n[BOOT] GPS-MQTT Tracker — iniciando...");
+  Serial.println("\n[BOOT] GPS-MQTT Tracker v2 (OTA) — iniciando...");
+  Serial.printf("[BOOT] Firmware: v%s\n", FIRMWARE_VERSION);
   Serial.printf("[BOOT] Topic datos:  %s/%u\n", TOPIC_BASE, DEVICE_ID);
   Serial.printf("[BOOT] Topic global: %s/%u\n", TOPIC_GLOBAL, DEVICE_ID);
+  Serial.printf("[BOOT] OTA topic:    %s%u\n", OTA_CMD_TOPIC_PREFIX, DEVICE_ID);
   Serial.printf("[BOOT] Struct size:  %u bytes\n",
                 (unsigned)sizeof(data_pkt_t));
+
+  // ── Cargar token OTA desde NVS ──────────────────────────────
+  loadOtaToken();
+
+  // ── CONFIGURA EL TOKEN OTA AQUÍ LA PRIMERA VEZ ─────────────
+  // Descomenta y ajusta la siguiente línea para guardar el token:
+   // saveOtaToken("12345678");
 
   // ── Iniciar SerialAT ─────────────────────────────────────────
   SerialAT.begin(MODEM_BAUDRATE, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
@@ -1100,6 +1879,11 @@ void setup() {
     Serial.println("[MQTT] Conexión inicial fallida — se reintentará en loop");
   }
 
+  // ── Verificación automática de OTA al arrancar ───────────────
+  // Se ejecuta aunque MQTT haya fallado (solo necesita datos móviles).
+  // Si hay nueva versión, doOTA() descarga e instala, luego reinicia.
+  checkOtaOnBoot();
+
   Serial.println("[BOOT] Sistema listo");
 }
 
@@ -1134,16 +1918,26 @@ void loop() {
     }
   }
 
-  // ── Procesar URCs acumulados durante comandos AT ──────────────
-  // (ya NO leer SerialAT directamente aquí)
+  // ── Procesar URCs acumulados ──────────────────────────────────
   if (urcPending.length() > 0) {
-    if (urcPending.indexOf("+CGEV: NW PDN DEACT") != -1 ||
-        urcPending.indexOf("+CMQTTNONET") != -1 ||
-        urcPending.indexOf("+CMQTTCONNLOST") != -1) {
+    bool hasMqttDisconnect = urcPending.indexOf("+CGEV: NW PDN DEACT") != -1 ||
+                             urcPending.indexOf("+CMQTTNONET") != -1 ||
+                             urcPending.indexOf("+CMQTTCONNLOST") != -1;
+
+    bool hasMqttMsg = urcPending.indexOf("+CMQTTRXSTART") != -1;
+
+    if (hasMqttDisconnect) {
       Serial.print("[NET] URC: ");
       Serial.print(urcPending);
       mqttConnected = false;
     }
+
+    // ── Procesar mensaje MQTT entrante ───────────────────────
+    if (hasMqttMsg) {
+      Serial.println("[MQTT-RX] Mensaje entrante detectado");
+      processIncomingMqtt();
+    }
+
     urcPending = "";
   }
 
@@ -1155,20 +1949,30 @@ void loop() {
     char c = SerialAT.read();
     urcBuf += c;
     if (c == '\n') {
-      if (urcBuf.indexOf("+CGEV: NW PDN DEACT") != -1 ||
-          urcBuf.indexOf("+CMQTTNONET") != -1 ||
-          urcBuf.indexOf("+CMQTTCONNLOST") != -1) {
+      bool isDisconnect = urcBuf.indexOf("+CGEV: NW PDN DEACT") != -1 ||
+                          urcBuf.indexOf("+CMQTTNONET") != -1 ||
+                          urcBuf.indexOf("+CMQTTCONNLOST") != -1;
+
+      if (isDisconnect) {
         Serial.print("[NET] URC (libre): ");
         Serial.print(urcBuf);
         mqttConnected = false;
       }
+
+      // ── Detectar mensaje MQTT entrante ─────────────────────
+      if (urcBuf.indexOf("+CMQTTRXSTART") != -1) {
+        Serial.println("[MQTT-RX] Mensaje detectado en loop libre");
+        urcPending += urcBuf;
+        // Procesarlo en la próxima iteración del loop
+      }
+
       urcBuf = "";
     }
-    if (urcBuf.length() > 128)
+    if (urcBuf.length() > 256)
       urcBuf = "";
   }
 
-  // En loop(), antes del bloque de reconexión MQTT:
+  // ── Watchdog del módem ────────────────────────────────────────
   if (millis() - lastModemCheck > MODEM_CHECK_INTERVAL) {
     lastModemCheck = millis();
     if (!modemIsAlive()) {
