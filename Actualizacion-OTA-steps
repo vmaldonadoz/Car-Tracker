@@ -1,0 +1,56 @@
+Paso 2 — Cuando quieras publicar una nueva versión (v2.1, etc.)
+2a. Compilar el firmware como .bin en Arduino IDE
+Sketch → Export Compiled Binary (o en VS Code con Arduino extension: Ctrl+Shift+P → Arduino: Export Compiled Binary)
+Te genera un archivo GPS-MQTT.ino.bin en la carpeta del proyecto
+2b. Crear un Release en GitHub
+Ve a https://github.com/vmaldonadoz/Car-Tracker/releases/new
+En Tag version pon: v2.1
+En Release title pon: v2.1 - descripción del cambio
+Arrastra el .bin compilado al área de archivos adjuntos
+Renómbralo GPS-MQTT.bin (o deja el nombre que tenga)
+Clic en Publish release
+El .bin quedará disponible en una URL como:
+
+https://github.com/vmaldonadoz/Car-Tracker/releases/download/v2.1/GPS-MQTT.bin
+2c. Actualizar version.json en el repo
+Edita 
+
+version.json
+ con la nueva versión:
+
+json
+{
+  "version": "2.1",
+  "url": "https://github.com/vmaldonadoz/Car-Tracker/releases/download/v2.1/GPS-MQTT.bin"
+}
+Luego:
+
+bash
+git add version.json
+git commit -m "release: v2.1"
+git push origin main
+A partir de ese momento, la próxima vez que el ESP32 encienda, verá "version":"2.1" ≠ FIRMWARE_VERSION "2.0", descargará el .bin del Release y se actualizará solo. ✅
+
+Resumen visual del flujo
+Arduino IDE
+    │
+    ▼ Export Compiled Binary
+GPS-MQTT.ino.bin
+    │
+    ▼ Subir como adjunto
+GitHub Release v2.1  ←── URL del .bin
+    │
+    ▼ Editar
+version.json  {"version":"2.1","url":"..."}
+    │
+    ▼ git push
+raw.githubusercontent.com/...version.json
+    │
+    ▼ Al encender el ESP32
+checkOtaOnBoot() → descarga → instala → reinicia
+
+
+Verificar version
+
+mosquitto_sub -h 200.44.171.179 -p 4033 -t "tracker/status/version/4" --retained-only -C 1
+
