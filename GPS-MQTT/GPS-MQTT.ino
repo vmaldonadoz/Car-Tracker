@@ -88,8 +88,10 @@ const int port = 4033;
 // Escucha:  tracker/cmd/ota/<DEVICE_ID>
 //   payload: {"token":"...","version":"1.1","url":"https://..."}
 // Publica:  tracker/status/ota/<DEVICE_ID>
-#define OTA_CMD_TOPIC_PREFIX "tracker/cmd/ota/"
+// Versión:  tracker/status/version/<DEVICE_ID>  (retained)
+#define OTA_CMD_TOPIC_PREFIX    "tracker/cmd/ota/"
 #define OTA_STATUS_TOPIC_PREFIX "tracker/status/ota/"
+#define VERSION_TOPIC_PREFIX    "tracker/status/version/"
 
 // ─── Token OTA por defecto (NVS sobreescribe si existe) ────────
 // Mínimo 8 caracteres. Dejar vacío fuerza configuración via NVS.
@@ -1875,6 +1877,19 @@ void setup() {
   // ── Primera conexión MQTT ───────────────────────────────────
   if (mqttConnect()) {
     mqttConnected = true;
+
+    // ── Publicar versión actual (retained) ─────────────────────
+    // Queda en el broker para consultarla en cualquier momento.
+    // Topic: tracker/status/version/<DEVICE_ID>
+    char verTopic[64];
+    char verPayload[96];
+    snprintf(verTopic, sizeof(verTopic), "%s%u", VERSION_TOPIC_PREFIX, DEVICE_ID);
+    snprintf(verPayload, sizeof(verPayload),
+             "{\"device_id\":%u,\"version\":\"%s\"}",
+             DEVICE_ID, FIRMWARE_VERSION);
+    mqttPublishText(verTopic, verPayload, /*qos=*/1, /*retain=*/1);
+    Serial.printf("[BOOT] Versión publicada en %s\n", verTopic);
+
   } else {
     Serial.println("[MQTT] Conexión inicial fallida — se reintentará en loop");
   }
