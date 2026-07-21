@@ -48,7 +48,9 @@
 // URL de un JSON estático con la versión disponible. Formato:
 //   {"version":"2.1","url":"https://example.com/firmware.bin"}
 // Dejar vacío ("") para deshabilitar la verificación automática.
-#define OTA_VERSION_URL "https://raw.githubusercontent.com/vmaldonadoz/Car-Tracker/main/version.json"
+#define OTA_VERSION_URL                                                        \
+  "https://raw.githubusercontent.com/vmaldonadoz/Car-Tracker/main/"            \
+  "version.json"
 
 // ─── Identificación del dispositivo ────────────────────────────
 #define DEVICE_ID 4
@@ -89,9 +91,9 @@ const int port = 4033;
 //   payload: {"token":"...","version":"1.1","url":"https://..."}
 // Publica:  tracker/status/ota/<DEVICE_ID>
 // Versión:  tracker/status/version/<DEVICE_ID>  (retained)
-#define OTA_CMD_TOPIC_PREFIX    "tracker/cmd/ota/"
+#define OTA_CMD_TOPIC_PREFIX "tracker/cmd/ota/"
 #define OTA_STATUS_TOPIC_PREFIX "tracker/status/ota/"
-#define VERSION_TOPIC_PREFIX    "tracker/status/version/"
+#define VERSION_TOPIC_PREFIX "tracker/status/version/"
 
 // ─── Token OTA por defecto (NVS sobreescribe si existe) ────────
 // Mínimo 8 caracteres. Dejar vacío fuerza configuración via NVS.
@@ -1176,7 +1178,8 @@ void checkOtaOnBoot() {
 
   flushModem();
   SerialAT.println("AT+CHTTPSHEAD=0," + String(httpReq.length()));
-  if (!waitPromptAndSend((const uint8_t *)httpReq.c_str(), httpReq.length(), 10000)) {
+  if (!waitPromptAndSend((const uint8_t *)httpReq.c_str(), httpReq.length(),
+                         10000)) {
     Serial.println("[OTA-BOOT] Fallo enviando petición GET");
     sendAT("AT+CHTTPSCLSE=0", "OK", 5000);
     sendAT("AT+CHTTPSNULL", "OK", 5000);
@@ -1206,9 +1209,13 @@ void checkOtaOnBoot() {
         if (!gotBlock && recvHdr.indexOf("+CHTTPSRECV: DATA,") != -1) {
           int idx = recvHdr.indexOf("+CHTTPSRECV: DATA,");
           int eol = recvHdr.indexOf('\n', idx);
-          if (eol == -1) continue;
+          if (eol == -1)
+            continue;
           int dataLen = recvHdr.substring(idx + 18, eol).toInt();
-          if (dataLen <= 0) { done = true; break; }
+          if (dataLen <= 0) {
+            done = true;
+            break;
+          }
 
           gotBlock = true;
           uint8_t tmp[MANIFEST_BLOCK + 32];
@@ -1221,7 +1228,8 @@ void checkOtaOnBoot() {
           responseBuf += String((char *)tmp).substring(0, rx);
 
           // Dejar de leer si ya tenemos suficiente (2 KB máx)
-          if (responseBuf.length() >= 2048) done = true;
+          if (responseBuf.length() >= 2048)
+            done = true;
           break;
         }
 
@@ -1231,9 +1239,11 @@ void checkOtaOnBoot() {
           break;
         }
       }
-      if (gotBlock || done) break;
+      if (gotBlock || done)
+        break;
     }
-    if (!gotBlock) done = true;
+    if (!gotBlock)
+      done = true;
     delay(50);
   }
 
@@ -1242,9 +1252,8 @@ void checkOtaOnBoot() {
 
   // ── Extraer cuerpo JSON (tras \r\n\r\n) ────────────────────────
   int bodyStart = responseBuf.indexOf("\r\n\r\n");
-  String jsonBody = (bodyStart != -1)
-                      ? responseBuf.substring(bodyStart + 4)
-                      : responseBuf;
+  String jsonBody =
+      (bodyStart != -1) ? responseBuf.substring(bodyStart + 4) : responseBuf;
   jsonBody.trim();
 
   Serial.printf("[OTA-BOOT] Respuesta del servidor: %s\n", jsonBody.c_str());
@@ -1253,15 +1262,17 @@ void checkOtaOnBoot() {
   auto extractField = [](const String &json, const String &key) -> String {
     String search = "\"" + key + "\":\"";
     int idx = json.indexOf(search);
-    if (idx == -1) return "";
+    if (idx == -1)
+      return "";
     idx += search.length();
     int end = json.indexOf("\"", idx);
-    if (end == -1) return "";
+    if (end == -1)
+      return "";
     return json.substring(idx, end);
   };
 
   String remoteVersion = extractField(jsonBody, "version");
-  String remoteUrl     = extractField(jsonBody, "url");
+  String remoteUrl = extractField(jsonBody, "url");
 
   if (remoteVersion.length() == 0 || remoteUrl.length() == 0) {
     Serial.println("[OTA-BOOT] Manifiesto inválido (faltan version o url)");
@@ -1281,14 +1292,15 @@ void checkOtaOnBoot() {
     return;
   }
 
-  Serial.printf("[OTA-BOOT] *** Nueva versión disponible: %s → actualizando ***\n",
-                remoteVersion.c_str());
+  Serial.printf(
+      "[OTA-BOOT] *** Nueva versión disponible: %s → actualizando ***\n",
+      remoteVersion.c_str());
 
   // Publicar estado si MQTT está conectado
   if (mqttConnected) {
-    String statusMsg = "{\"status\":\"auto_ota_inicio\",\"desde\":\""
-                       + String(FIRMWARE_VERSION) + "\",\"hacia\":\""
-                       + remoteVersion + "\"}";
+    String statusMsg = "{\"status\":\"auto_ota_inicio\",\"desde\":\"" +
+                       String(FIRMWARE_VERSION) + "\",\"hacia\":\"" +
+                       remoteVersion + "\"}";
     publishOtaStatus(statusMsg.c_str());
     delay(300);
   }
@@ -1730,7 +1742,7 @@ void setup() {
 
   // ── CONFIGURA EL TOKEN OTA AQUÍ LA PRIMERA VEZ ─────────────
   // Descomenta y ajusta la siguiente línea para guardar el token:
-   // saveOtaToken("12345678");
+  // saveOtaToken("12345678");
 
   // ── Iniciar SerialAT ─────────────────────────────────────────
   SerialAT.begin(MODEM_BAUDRATE, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
@@ -1883,10 +1895,11 @@ void setup() {
     // Topic: tracker/status/version/<DEVICE_ID>
     char verTopic[64];
     char verPayload[96];
-    snprintf(verTopic, sizeof(verTopic), "%s%u", VERSION_TOPIC_PREFIX, DEVICE_ID);
+    snprintf(verTopic, sizeof(verTopic), "%s%u", VERSION_TOPIC_PREFIX,
+             DEVICE_ID);
     snprintf(verPayload, sizeof(verPayload),
-             "{\"device_id\":%u,\"version\":\"%s\"}",
-             DEVICE_ID, FIRMWARE_VERSION);
+             "{\"device_id\":%u,\"version\":\"%s\"}", DEVICE_ID,
+             FIRMWARE_VERSION);
     mqttPublishText(verTopic, verPayload, /*qos=*/1, /*retain=*/1);
     Serial.printf("[BOOT] Versión publicada en %s\n", verTopic);
 
