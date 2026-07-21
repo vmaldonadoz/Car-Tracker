@@ -42,21 +42,21 @@
 #include <Update.h>
 
 // ─── Versión de firmware ────────────────────────────────────────
-#define FIRMWARE_VERSION "2.1"
+#define FIRMWARE_VERSION "2.2"
 
 // ─── OTA automático al arrancar ─────────────────────────────────
 // URL de un JSON estático con la versión disponible. Formato:
 //   {"version":"2.1","url":"https://example.com/firmware.bin"}
 // Dejar vacío ("") para deshabilitar la verificación automática.
-#define OTA_VERSION_URL                                                        \
-  "https://raw.githubusercontent.com/vmaldonadoz/Car-Tracker/main/"            \
+#define OTA_VERSION_URL \
+  "https://raw.githubusercontent.com/vmaldonadoz/Car-Tracker/main/" \
   "version.json"
 
 // ─── Identificación del dispositivo ────────────────────────────
-#define DEVICE_ID 1
+#define DEVICE_ID 4
 
 // ─── SIM y APN ─────────────────────────────────────────────────
-#define SIM_PIN "" // dejar vacío si la SIM no tiene PIN
+#define SIM_PIN ""  // dejar vacío si la SIM no tiene PIN
 #define NETWORK_APN "internet.movistar.ve"
 
 // ─── Pines LilyGO T-A7670G ────────────────────────────────────
@@ -64,24 +64,24 @@
 #define MODEM_TX_PIN 26
 #define MODEM_RX_PIN 27
 #define BOARD_PWRKEY_PIN 4
-#define BOARD_POWERON_PIN 12 // HIGH = alimenta el módulo A7670G
+#define BOARD_POWERON_PIN 12  // HIGH = alimenta el módulo A7670G
 #define MODEM_RESET_PIN 5
 #define MODEM_RESET_LEVEL HIGH
 #define SerialAT Serial1
 
 // ─── Pines GPS L76K ────────────────────────────────────────────
 // Solo recibimos NMEA del GPS; TX del ESP no está conectado.
-#define GPS_RX_PIN 22 // GPIO que recibe el TX del L76K
+#define GPS_RX_PIN 22  // GPIO que recibe el TX del L76K
 #define GPS_BAUD 9600
-HardwareSerial GPS(2); // UART2 del ESP32
+HardwareSerial GPS(2);  // UART2 del ESP32
 
 // ─── MQTT broker ───────────────────────────────────────────────
 const char *broker = "200.44.171.179";
 const int port = 4033;
 
 // ─── Topics (mismo esquema que rx.ino) ─────────────────────────
-#define TOPIC_BASE "gps/vehiculos" // <topicBase>/<device_id>
-#define TOPIC_GLOBAL "gps/global"  // retained con el seq
+#define TOPIC_BASE "gps/vehiculos"  // <topicBase>/<device_id>
+#define TOPIC_GLOBAL "gps/global"   // retained con el seq
 
 // ─── ID de esta estación (equivale a stationId del rx) ────────
 #define STATION_ID "hoatzin"
@@ -100,14 +100,14 @@ const int port = 4033;
 #define OTA_TOKEN_DEFAULT ""
 
 // ─── Umbrales de movimiento real ─────────────────────────────────────
-#define DISTANCE_MIN_M 15.0f // metros mínimos entre publicaciones en movimiento
-#define MIN_SPEED_KMPH 2.0f  // km/h mínimo para considerar movimiento real
-#define HDOP_MAX 1.5f        // HDOP máximo aceptable
-#define SAT_MIN 5            // satélites mínimos requeridos
+#define DISTANCE_MIN_M 15.0f  // metros mínimos entre publicaciones en movimiento
+#define MIN_SPEED_KMPH 2.0f   // km/h mínimo para considerar movimiento real
+#define HDOP_MAX 1.5f         // HDOP máximo aceptable
+#define SAT_MIN 5             // satélites mínimos requeridos
 
 // EMA adaptativo
-#define EMA_ALPHA_MOVING 0.4f // cuando está en movimiento
-#define EMA_ALPHA_STILL 0.05f // cuando está detenido — filtro muy agresivo
+#define EMA_ALPHA_MOVING 0.4f  // cuando está en movimiento
+#define EMA_ALPHA_STILL 0.05f  // cuando está detenido — filtro muy agresivo
 
 // Hysteresis de velocidad: cuántas lecturas consecutivas por encima
 // del umbral antes de declarar "en movimiento"
@@ -118,7 +118,7 @@ const int port = 4033;
 
 // Heartbeat estacionario: publicar aunque no haya movimiento
 // para confirmar que el tracker está activo y reportar última posición.
-#define STATIONARY_HEARTBEAT_MS 300000UL // cada 5 minutos
+#define STATIONARY_HEARTBEAT_MS 300000UL  // cada 5 minutos
 
 // ─── Tamaño máximo del JSON de payload ─────────────────────────
 //  device_id(5)+ts(19)+lat(12)+lon(12)+flags(1)+seq(5) + claves ≈ 95
@@ -126,14 +126,14 @@ const int port = 4033;
 
 // ─── Variables watchdog ───────────────────────────────────────────
 uint32_t lastModemCheck = 0;
-#define MODEM_CHECK_INTERVAL 120000UL // verificar cada 2 minutos
+#define MODEM_CHECK_INTERVAL 120000UL  // verificar cada 2 minutos
 
 // ─── Log periódico del GPS ───────────────────────────────────────
 uint32_t lastGpsLog = 0;
-#define GPS_LOG_INTERVAL 30000UL // imprimir estado cada 30 s
+#define GPS_LOG_INTERVAL 30000UL  // imprimir estado cada 30 s
 
 // ─── Heartbeat estacionario ─────────────────────────────────────
-uint32_t lastHeartbeat = 0; // última publicación de posición estacionaria
+uint32_t lastHeartbeat = 0;  // última publicación de posición estacionaria
 
 // ─── Almacenamiento offline (store-and-forward) ─────────────────
 #define OFFLINE_DATA_FILE "/ofq.bin"
@@ -144,16 +144,21 @@ uint32_t lastHeartbeat = 0; // última publicación de posición estacionaria
 // ═══════════════════════════════════════════════════════════════
 #define PKT_DATA 0x01
 
+// ─── Verificación OTA pendiente (reintentable desde loop) ──────
+bool otaCheckDone = false;  // true cuando el manifiesto se pudo leer con éxito
+uint32_t lastOtaCheckAttempt = 0;
+#define OTA_CHECK_RETRY_MS 60000UL  // reintentar cada 60 s si falló
+
 typedef struct __attribute__((packed)) {
-  uint8_t pkt_type;   //  1 byte  – offset  0
-  uint16_t device_id; //  2 bytes – offset  1
-  uint16_t seq;       //  2 bytes – offset  3
-  char timestamp[20]; // 20 bytes – offset  5
-  int32_t lat;        //  4 bytes – offset 25
-  int32_t lon;        //  4 bytes – offset 29
-  uint16_t speed;     //  2 bytes – offset 33
-  uint8_t flags;      //  1 byte  – offset 35
-} data_pkt_t;         // = 36 bytes total
+  uint8_t pkt_type;    //  1 byte  – offset  0
+  uint16_t device_id;  //  2 bytes – offset  1
+  uint16_t seq;        //  2 bytes – offset  3
+  char timestamp[20];  // 20 bytes – offset  5
+  int32_t lat;         //  4 bytes – offset 25
+  int32_t lon;         //  4 bytes – offset 29
+  uint16_t speed;      //  2 bytes – offset 33
+  uint8_t flags;       //  1 byte  – offset 35
+} data_pkt_t;          // = 36 bytes total
 
 static_assert(sizeof(data_pkt_t) == 36, "data_pkt_t size mismatch");
 
@@ -175,12 +180,12 @@ double smoothLon = 0.0;
 bool emaReady = false;
 
 // ─── Hysteresis de movimiento ─────────────────────────────────────────
-uint8_t movingConfirm = 0;  // contador de lecturas "rápidas"
-bool isMovingState = false; // estado filtrado: en movimiento o no
-uint32_t lastPubMs = 0;     // timestamp de última publicación
+uint8_t movingConfirm = 0;   // contador de lecturas "rápidas"
+bool isMovingState = false;  // estado filtrado: en movimiento o no
+uint32_t lastPubMs = 0;      // timestamp de última publicación
 
 // ─── Buffer de URCs asíncronos ────────────────────────────────
-static String urcPending = ""; // URCs recibidos durante comandos AT
+static String urcPending = "";  // URCs recibidos durante comandos AT
 
 // ─── Token OTA (cargado desde NVS en setup) ───────────────────
 static char otaToken[64] = OTA_TOKEN_DEFAULT;
@@ -204,9 +209,9 @@ void loadOtaToken() {
   prefs.end();
   if (strlen(otaToken) < 8) {
     Serial.println(
-        "[SEC] *** ADVERTENCIA: Token OTA no configurado — OTA bloqueado ***");
+      "[SEC] *** ADVERTENCIA: Token OTA no configurado — OTA bloqueado ***");
     Serial.println(
-        "[SEC]     Configura el token via: saveOtaToken(\"mi_token\")");
+      "[SEC]     Configura el token via: saveOtaToken(\"mi_token\")");
   } else {
     Serial.println("[SEC] Token OTA cargado desde NVS OK");
   }
@@ -245,9 +250,7 @@ bool sendAT(const String &cmd, const String &expected = "OK",
       char c = SerialAT.read();
       buf += c;
       if (c == '\n') {
-        if (buf.indexOf("+CGEV: NW PDN DEACT") != -1 ||
-            buf.indexOf("+CMQTTNONET") != -1 ||
-            buf.indexOf("+CMQTTCONNLOST") != -1) {
+        if (buf.indexOf("+CGEV: NW PDN DEACT") != -1 || buf.indexOf("+CMQTTNONET") != -1 || buf.indexOf("+CMQTTCONNLOST") != -1) {
           urcPending += buf;
         }
         // ── Detectar mensaje MQTT entrante ───────────────────
@@ -276,9 +279,7 @@ String sendATStr(const String &cmd, uint32_t ms = 5000) {
 
       // Acumular líneas completas y detectar URCs
       if (c == '\n') {
-        if (buf.indexOf("+CGEV: NW PDN DEACT") != -1 ||
-            buf.indexOf("+CMQTTNONET") != -1 ||
-            buf.indexOf("+CMQTTCONNLOST") != -1) {
+        if (buf.indexOf("+CGEV: NW PDN DEACT") != -1 || buf.indexOf("+CMQTTNONET") != -1 || buf.indexOf("+CMQTTCONNLOST") != -1) {
           urcPending += buf;
         }
         // ── Detectar mensaje MQTT entrante ───────────────────
@@ -453,9 +454,9 @@ bool forceReattach() {
   delay(500);
 
   // Deregistrar de la red y volver a modo automático
-  sendAT("AT+COPS=2", "OK", 15000); // desconectar de operador
+  sendAT("AT+COPS=2", "OK", 15000);  // desconectar de operador
   delay(3000);
-  sendAT("AT+COPS=0", "OK", 30000); // reconectar automático
+  sendAT("AT+COPS=0", "OK", 30000);  // reconectar automático
   delay(2000);
 
   // Esperar registro real (con celda válida)
@@ -464,7 +465,7 @@ bool forceReattach() {
     String r = sendATStr("AT+CREG?", 3000);
     if (r.indexOf(",1") != -1 || r.indexOf(",5") != -1) {
       // Verificar que la celda sea real antes de continuar
-      if (isPDPSessionValid() || i > 20) { // tras 20 s aceptar igual
+      if (isPDPSessionValid() || i > 20) {  // tras 20 s aceptar igual
         Serial.println(" OK");
         return true;
       }
@@ -488,8 +489,7 @@ bool reactivatePDP() {
       String ip = sendATStr("AT+CGPADDR=1", 5000);
       Serial.print("[NET] IP tras reactivar: ");
       Serial.println(ip);
-      bool hasIp = ip.indexOf("186.") != -1 || ip.indexOf("10.") != -1 ||
-                   ip.indexOf("172.") != -1 || ip.indexOf("192.") != -1;
+      bool hasIp = ip.indexOf("186.") != -1 || ip.indexOf("10.") != -1 || ip.indexOf("172.") != -1 || ip.indexOf("192.") != -1;
       if (!hasIp) {
         delay(3000);
         continue;
@@ -498,7 +498,7 @@ bool reactivatePDP() {
       // Verificar que no sea una sesión fantasma
       if (!isPDPSessionValid()) {
         Serial.println(
-            "[NET] Sesión inválida tras reactivar — forzando re-enganche");
+          "[NET] Sesión inválida tras reactivar — forzando re-enganche");
         forceReattach();
         // Reactivar PDP después del re-enganche
         sendAT("AT+CGDCONT=1,\"IP\",\"" NETWORK_APN "\"", "OK", 5000);
@@ -591,7 +591,7 @@ void hardResetModem() {
   digitalWrite(BOARD_PWRKEY_PIN, HIGH);
   delay(1500);
   digitalWrite(BOARD_PWRKEY_PIN, LOW);
-  delay(2000); // esperar que apague completamente
+  delay(2000);  // esperar que apague completamente
 
   // Encender: pulso corto en PWRKEY
   digitalWrite(BOARD_PWRKEY_PIN, HIGH);
@@ -606,7 +606,7 @@ void hardResetModem() {
     delay(1000);
     if (retry++ > 20) {
       Serial.println("\n[MDM] ⚠ Módem no arranca — reiniciando ESP32");
-      ESP.restart(); // último recurso
+      ESP.restart();  // último recurso
     }
   }
   Serial.println(" OK");
@@ -678,7 +678,7 @@ bool mqttConnect() {
     sendAT("AT+CMQTTREL=0", "OK", 3000);
     delay(800);
     sendAT("AT+CMQTTSTOP", "OK", 8000);
-    delay(2500); // pausa crítica para cerrar socket TCP interno
+    delay(2500);  // pausa crítica para cerrar socket TCP interno
 
     // Arrancar stack limpio
     if (!sendAT("AT+CMQTTSTART", "OK", 10000)) {
@@ -938,7 +938,7 @@ int32_t httpReadChunk(int32_t offset, int32_t size, uint8_t *buf) {
   while (got < dataLen && millis() - tLast < INTER_BYTE_TO) {
     if (SerialAT.available()) {
       buf[got++] = SerialAT.read();
-      tLast = millis(); // resetear en cada byte recibido
+      tLast = millis();  // resetear en cada byte recibido
     }
   }
 
@@ -969,7 +969,7 @@ void doOTA(const String &version, const String &url) {
   Serial.printf("[OTA] Versión objetivo: %s\n", version.c_str());
 
   publishOtaStatus(
-      ("{\"status\":\"descargando\",\"target\":\"" + version + "\"}").c_str());
+    ("{\"status\":\"descargando\",\"target\":\"" + version + "\"}").c_str());
   delay(300);
 
   int32_t totalSize = httpGetInit(url);
@@ -990,7 +990,7 @@ void doOTA(const String &version, const String &url) {
   Serial.println("[OTA] Update.begin() OK — descargando...");
 
   const int32_t CHUNK_SIZE = 1024;
-  static uint8_t chunkBuf[CHUNK_SIZE]; // static → no consume stack
+  static uint8_t chunkBuf[CHUNK_SIZE];  // static → no consume stack
   int32_t offset = 0;
   int32_t written = 0;
   bool failed = false;
@@ -1075,24 +1075,22 @@ void doOTA(const String &version, const String &url) {
 
     Llama esta función desde setup() DESPUÉS de mqttConnect().
 */
-void checkOtaOnBoot() {
+bool checkOtaOnBoot() {
   if (strlen(OTA_VERSION_URL) == 0) {
     Serial.println("[OTA-BOOT] Sin URL de versión configurada — omitiendo");
-    return;
+    return true;  // no hay nada que verificar, no es un fallo
   }
 
   Serial.println("[OTA-BOOT] ── Verificando versión de firmware ──");
   Serial.printf("[OTA-BOOT] Versión actual : %s\n", FIRMWARE_VERSION);
   Serial.printf("[OTA-BOOT] URL manifiesto : %s\n", OTA_VERSION_URL);
 
-  // ── Descargar manifiesto JSON ─────────────────────────────────
   int32_t manifestLen = httpGetInit(String(OTA_VERSION_URL));
   if (manifestLen <= 0) {
     Serial.println("[OTA-BOOT] No se pudo obtener el manifiesto");
-    return;
+    return false;  // ← señal para reintentar más tarde
   }
 
-  // Leer el cuerpo (el manifiesto es pequeño — máx 512 bytes)
   const int32_t MAX_MANIFEST = 512;
   static uint8_t manifestBuf[MAX_MANIFEST + 1];
   int32_t got = httpReadChunk(0, min(manifestLen, MAX_MANIFEST), manifestBuf);
@@ -1100,24 +1098,21 @@ void checkOtaOnBoot() {
 
   if (got <= 0) {
     Serial.println("[OTA-BOOT] No se pudo leer el manifiesto");
-    return;
+    return false;  // ← también reintentar
   }
-  manifestBuf[got] = '\0'; // null-terminate para usarlo como String
+  manifestBuf[got] = '\0';
 
   String jsonBody = String((char *)manifestBuf);
   jsonBody.trim();
   Serial.printf("[OTA-BOOT] Manifiesto: %s\n", jsonBody.c_str());
 
-  // ── Parsear version y url del JSON ────────────────────────────
   auto extractField = [](const String &json, const String &key) -> String {
     String search = "\"" + key + "\":\"";
     int idx = json.indexOf(search);
-    if (idx == -1)
-      return "";
+    if (idx == -1) return "";
     idx += search.length();
     int end = json.indexOf("\"", idx);
-    if (end == -1)
-      return "";
+    if (end == -1) return "";
     return json.substring(idx, end);
   };
 
@@ -1126,34 +1121,33 @@ void checkOtaOnBoot() {
 
   if (remoteVersion.length() == 0 || remoteUrl.length() == 0) {
     Serial.println("[OTA-BOOT] Manifiesto inválido (faltan version o url)");
-    return;
+    return true;  // el manifiesto respondió pero está mal formado — no insistir en loop
   }
 
   Serial.printf("[OTA-BOOT] Versión remota : %s\n", remoteVersion.c_str());
 
   if (remoteVersion == FIRMWARE_VERSION) {
     Serial.println("[OTA-BOOT] Firmware al día — sin actualización.");
-    return;
+    return true;
   }
 
   if (!remoteUrl.startsWith("https://")) {
     Serial.println("[OTA-BOOT] URL del firmware no es https:// — abortando");
-    return;
+    return true;  // no es un fallo de red, es config inválida — no insistir
   }
 
   Serial.printf("[OTA-BOOT] *** Nueva versión disponible: %s → %s ***\n",
                 FIRMWARE_VERSION, remoteVersion.c_str());
-  Serial.println("[OTA-BOOT] Iniciando actualización OTA...");
 
   if (mqttConnected) {
-    String statusMsg = "{\"status\":\"auto_ota_inicio\",\"desde\":\"" +
-                       String(FIRMWARE_VERSION) + "\",\"hacia\":\"" +
-                       remoteVersion + "\"}";
+    String statusMsg = "{\"status\":\"auto_ota_inicio\",\"desde\":\"" + String(FIRMWARE_VERSION) + "\",\"hacia\":\"" + remoteVersion + "\"}";
     publishOtaStatus(statusMsg.c_str());
     delay(300);
   }
 
-  doOTA(remoteVersion, remoteUrl);
+  doOTA(remoteVersion, remoteUrl);  // si tiene éxito, reinicia el ESP32 y no vuelve aquí
+
+  return true;  // si doOTA falló sin reiniciar, igual no insistas en loop — ya quedó loggeado
 }
 
 /*
@@ -1245,7 +1239,7 @@ void processIncomingMqtt() {
   while (millis() - t0 < 3000) {
     while (SerialAT.available()) {
       fullBuf += (char)SerialAT.read();
-      t0 = millis(); // resetear timeout mientras llegan datos
+      t0 = millis();  // resetear timeout mientras llegan datos
     }
     if (fullBuf.indexOf("+CMQTTRXEND") != -1)
       break;
@@ -1314,7 +1308,7 @@ void processIncomingMqtt() {
     y formatea como "YYYY-MM-DDTHH:MM:SS" en 'out' (20 bytes).   */
 void gpsToISO_VET(int year, int month, int day, int hour, int minute,
                   int second, char *out) {
-  static const uint8_t dim[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  static const uint8_t dim[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
 
   // Workaround GPS week rollover
   if (year < 2019) {
@@ -1417,8 +1411,7 @@ void saveOffline(const data_pkt_t &pkt) {
 
     // Copiar los restantes al archivo temporal
     uint8_t cbuf[sizeof(data_pkt_t)];
-    while (src.readBytes((char *)cbuf, sizeof(data_pkt_t)) ==
-           sizeof(data_pkt_t))
+    while (src.readBytes((char *)cbuf, sizeof(data_pkt_t)) == sizeof(data_pkt_t))
       tmp.write(cbuf, sizeof(data_pkt_t));
 
     // Agregar el nuevo paquete al final
@@ -1431,8 +1424,8 @@ void saveOffline(const data_pkt_t &pkt) {
     LittleFS.rename("/ofq_tmp.bin", OFFLINE_DATA_FILE);
 
     Serial.printf(
-        "[FS] Buffer circular: seq=%u guardado (antiguo descartado)\n",
-        pkt.seq);
+      "[FS] Buffer circular: seq=%u guardado (antiguo descartado)\n",
+      pkt.seq);
   }
 }
 
@@ -1511,7 +1504,7 @@ void flushOfflineQueue() {
     siguiendo el mismo formato que publishPacket() del rx.ino.     */
 bool buildAndPublish() {
   bool hasFix =
-      gps.location.isValid() && gps.date.isValid() && gps.time.isValid();
+    gps.location.isValid() && gps.date.isValid() && gps.time.isValid();
   bool hdopOk = hasFix && gps.hdop.isValid() && (gps.hdop.hdop() < HDOP_MAX);
   bool moving = hasFix && gps.speed.isValid() && (gps.speed.kmph() >= 2.0f);
 
@@ -1523,7 +1516,7 @@ bool buildAndPublish() {
 
   if (hasFix) {
     bool hasSats =
-        !gps.satellites.isValid() || (gps.satellites.value() >= SAT_MIN);
+      !gps.satellites.isValid() || (gps.satellites.value() >= SAT_MIN);
     if (!hasSats) {
       Serial.printf("[GPS] Satélites insuficientes (%u < %u) — cancelado\n",
                     gps.satellites.value(), SAT_MIN);
@@ -1536,11 +1529,11 @@ bool buildAndPublish() {
     gpsToISO_VET(gps.date.year(), gps.date.month(), gps.date.day(),
                  gps.time.hour(), gps.time.minute(), gps.time.second(),
                  pkt.timestamp);
-    pkt.flags |= 0x01; // bit0 = fix válido
+    pkt.flags |= 0x01;  // bit0 = fix válido
     if (hdopOk)
-      pkt.flags |= 0x02; // bit1 = HDOP OK
+      pkt.flags |= 0x02;  // bit1 = HDOP OK
     if (moving)
-      pkt.flags |= 0x04; // bit2 = en movimiento
+      pkt.flags |= 0x04;  // bit2 = en movimiento
   } else {
     Serial.println("[GPS] Sin fix — publicación cancelada");
     return false;
@@ -1556,7 +1549,7 @@ bool buildAndPublish() {
   if (!isNetworkUp()) {
     Serial.println("[NET] Sin red móvil — guardando offline");
     saveOffline(pkt);
-    mqttConnected = false; // forzar reconexión cuando vuelva la red
+    mqttConnected = false;  // forzar reconexión cuando vuelva la red
     return false;
   }
 
@@ -1633,8 +1626,8 @@ void setup() {
   }
   Serial.println(" OK");
 
-  sendAT("ATE0", "OK");      // desactivar eco
-  sendAT("AT+CMEE=2", "OK"); // errores legibles
+  sendAT("ATE0", "OK");       // desactivar eco
+  sendAT("AT+CMEE=2", "OK");  // errores legibles
 
   delay(1000);
 
@@ -1656,7 +1649,7 @@ void setup() {
   }
 
   // ── Modo de red y APN ────────────────────────────────────────
-  sendAT("AT+CNMP=2", "OK", 5000); // modo automático (LTE/3G/2G)
+  sendAT("AT+CNMP=2", "OK", 5000);  // modo automático (LTE/3G/2G)
   sendAT("AT+CGDCONT=1,\"IP\",\"" NETWORK_APN "\"", "OK", 5000);
 
   // ── Esperar registro en red ──────────────────────────────────
@@ -1781,7 +1774,7 @@ void loop() {
                      "/ alimentación L76K");
     } else {
       bool fix =
-          gps.location.isValid() && gps.date.isValid() && gps.time.isValid();
+        gps.location.isValid() && gps.date.isValid() && gps.time.isValid();
       uint8_t sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
       float hdop = gps.hdop.isValid() ? gps.hdop.hdop() : 99.9f;
       float speed = gps.speed.isValid() ? gps.speed.kmph() : 0.0f;
@@ -1796,9 +1789,7 @@ void loop() {
 
   // ── Procesar URCs acumulados ──────────────────────────────────
   if (urcPending.length() > 0) {
-    bool hasMqttDisconnect = urcPending.indexOf("+CGEV: NW PDN DEACT") != -1 ||
-                             urcPending.indexOf("+CMQTTNONET") != -1 ||
-                             urcPending.indexOf("+CMQTTCONNLOST") != -1;
+    bool hasMqttDisconnect = urcPending.indexOf("+CGEV: NW PDN DEACT") != -1 || urcPending.indexOf("+CMQTTNONET") != -1 || urcPending.indexOf("+CMQTTCONNLOST") != -1;
 
     bool hasMqttMsg = urcPending.indexOf("+CMQTTRXSTART") != -1;
 
@@ -1825,9 +1816,7 @@ void loop() {
     char c = SerialAT.read();
     urcBuf += c;
     if (c == '\n') {
-      bool isDisconnect = urcBuf.indexOf("+CGEV: NW PDN DEACT") != -1 ||
-                          urcBuf.indexOf("+CMQTTNONET") != -1 ||
-                          urcBuf.indexOf("+CMQTTCONNLOST") != -1;
+      bool isDisconnect = urcBuf.indexOf("+CGEV: NW PDN DEACT") != -1 || urcBuf.indexOf("+CMQTTNONET") != -1 || urcBuf.indexOf("+CMQTTCONNLOST") != -1;
 
       if (isDisconnect) {
         Serial.print("[NET] URC (libre): ");
@@ -1872,10 +1861,21 @@ void loop() {
       if (mqttConnect()) {
         mqttConnected = true;
         lastReconnect = 0;
-        flushOfflineQueue(); // enviar lo acumulado al reconectar
+        flushOfflineQueue();  // enviar lo acumulado al reconectar
       }
     }
-    return; // no publicar hasta tener conexión
+    return;  // no publicar hasta tener conexión
+  }
+
+  // ── Reintentar verificación OTA si falló por falta de red ───────
+  if (!otaCheckDone && (millis() - lastOtaCheckAttempt > OTA_CHECK_RETRY_MS)) {
+    lastOtaCheckAttempt = millis();
+    if (isNetworkUp()) {
+      Serial.println("[OTA-BOOT] Reintentando verificación de firmware...");
+      otaCheckDone = checkOtaOnBoot();
+    } else {
+      Serial.println("[OTA-BOOT] Red aún no disponible — se reintentará");
+    }
   }
 
   // ── Flush periódico por si quedaron pendientes ───────────────
@@ -1886,7 +1886,7 @@ void loop() {
 
   // ── Publicar si el GPS tiene fix y se movió ≥ DISTANCE_MIN_M ───────
   if (!gps.location.isValid() || !gps.date.isValid() || !gps.time.isValid()) {
-    emaReady = false; // resetear EMA si se pierde el fix
+    emaReady = false;  // resetear EMA si se pierde el fix
     return;
   }
 
@@ -1897,7 +1897,7 @@ void loop() {
   // Alpha pequeño cuando estamos quietos = filtro muy agresivo
   float gpsSpeed = gps.speed.isValid() ? gps.speed.kmph() : 0.0f;
   float alpha =
-      (gpsSpeed >= MIN_SPEED_KMPH) ? EMA_ALPHA_MOVING : EMA_ALPHA_STILL;
+    (gpsSpeed >= MIN_SPEED_KMPH) ? EMA_ALPHA_MOVING : EMA_ALPHA_STILL;
 
   if (!emaReady) {
     smoothLat = curLat;
@@ -1919,7 +1919,7 @@ void loop() {
       isMovingState = true;
   } else {
     movingConfirm = 0;
-    isMovingState = false; // sale inmediatamente al detenerse
+    isMovingState = false;  // sale inmediatamente al detenerse
   }
 
   // ── Distancia desde última publicación ────────────────────────────
@@ -1937,7 +1937,7 @@ void loop() {
       lastLon = smoothLon;
       hasLastPos = true;
       lastPubMs = millis();
-      lastHeartbeat = millis(); // reiniciar heartbeat también
+      lastHeartbeat = millis();  // reiniciar heartbeat también
     }
     return;
   }
@@ -1972,15 +1972,7 @@ void diagSIMNetwork() {
 
   ATQuery queries[] = {
 
-      {"ICCID SIM", "AT+CICCID"},    {"IMSI SIM", "AT+CIMI"},
-      {"OPERADOR", "AT+COPS?"},      {"ESTADO SIM", "AT+CPIN?"},
-      {"CALIDAD RSSI", "AT+CSQ"},    {"CALIDAD EXTENDIDA", "AT+CESQ"},
-      {"REGISTRO GSM", "AT+CREG?"},  {"REGISTRO GPRS", "AT+CGREG?"},
-      {"REGISTRO LTE", "AT+CEREG?"}, {"APN", "AT+CGDCONT?"},
-      {"IP", "AT+CGPADDR=1"},        {"PDP", "AT+CGACT?"},
-      {"RED", "AT+CPSI?"},           {"PING", "AT+CDNSGIP=\"google.com\""},
-      {"IPv", "AT+CGPADDR=1"},       {"RESTRICC", "AT+COPS?"},
-      {"RESTRIC2", "AT+CPSI?"}
+    { "ICCID SIM", "AT+CICCID" }, { "IMSI SIM", "AT+CIMI" }, { "OPERADOR", "AT+COPS?" }, { "ESTADO SIM", "AT+CPIN?" }, { "CALIDAD RSSI", "AT+CSQ" }, { "CALIDAD EXTENDIDA", "AT+CESQ" }, { "REGISTRO GSM", "AT+CREG?" }, { "REGISTRO GPRS", "AT+CGREG?" }, { "REGISTRO LTE", "AT+CEREG?" }, { "APN", "AT+CGDCONT?" }, { "IP", "AT+CGPADDR=1" }, { "PDP", "AT+CGACT?" }, { "RED", "AT+CPSI?" }, { "PING", "AT+CDNSGIP=\"google.com\"" }, { "IPv", "AT+CGPADDR=1" }, { "RESTRICC", "AT+COPS?" }, { "RESTRIC2", "AT+CPSI?" }
 
   };
 
