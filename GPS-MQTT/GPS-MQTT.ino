@@ -42,7 +42,7 @@
 #include <Update.h>
 
 // ─── Versión de firmware ────────────────────────────────────────
-#define FIRMWARE_VERSION "2.0"
+#define FIRMWARE_VERSION "2.1"
 
 // ─── OTA automático al arrancar ─────────────────────────────────
 // URL de un JSON estático con la versión disponible. Formato:
@@ -53,7 +53,7 @@
   "version.json"
 
 // ─── Identificación del dispositivo ────────────────────────────
-#define DEVICE_ID 4
+#define DEVICE_ID 1
 
 // ─── SIM y APN ─────────────────────────────────────────────────
 #define SIM_PIN "" // dejar vacío si la SIM no tiene PIN
@@ -788,10 +788,6 @@ bool mqttConnect() {
   return true;
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  OTA — descarga via AT+CHTTPS* del módem A7670G
-// ═══════════════════════════════════════════════════════════════
-
 // Publica el estado OTA en tracker/status/ota/<DEVICE_ID>
 void publishOtaStatus(const char *json) {
   char topic[64];
@@ -800,307 +796,253 @@ void publishOtaStatus(const char *json) {
   Serial.printf("[OTA] Status: %s\n", json);
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  OTA — descarga via AT+HTTP* del módem A7670G
+// ═══════════════════════════════════════════════════════════════
+//  Comandos usados (sección 16 del manual A7670G):
+//    AT+HTTPINIT    — inicia el servicio HTTP
+//    AT+HTTPPARA    — configura parámetros (URL, etc.)
+//    AT+HTTPACTION  — ejecuta GET (0) / POST (1) / HEAD (2)
+//    AT+HTTPREAD    — lee el cuerpo de la respuesta en bloques
+//    AT+HTTPTERM    — detiene el servicio HTTP
+
 /*
-  Parsea "https://hostname/path" separando host y path.
-  Retorna false si no es https:// o el formato es inválido.
+  httpGetInit:
+    Inicia una sesión HTTP GET hacia 'url' y espera la respuesta.
+    Retorna el Content-Length anunciado por el servidor (> 0) o -1 si falla.
+    La respuesta queda en el buffer interno del módem — léela con
+    AT+HTTPREAD antes de llamar AT+HTTPTERM.
+
+  Flujo AT:
+    1. AT+HTTPTERM          → limpia sesión previa (ignorar resultado)
+    2. AT+HTTPINIT          → inicia servicio HTTP
+    3. AT+HTTPPARA="URL","…" → fija la URL (HTTP o HTTPS)
+    4. AT+HTTPACTION=0      → lanza el GET
+    5. Esperar URC: +HTTPACTION: 0,<code>,<len>
 */
-bool parseHttpsUrl(const String &url, String &host, String &path) {
-  if (!url.startsWith("https://"))
-    return false;
-  String rest = url.substring(8); // quitar "https://"
-  int slashPos = rest.indexOf('/');
-  if (slashPos < 0) {
-    host = rest;
-    path = "/";
-  } else {
-    host = rest.substring(0, slashPos);
-    path = rest.substring(slashPos);
+int32_t httpGetInit(const String &url) {
+  // Limpieza preventiva de sesión anterior
+  sendAT("AT+HTTPTERM", "OK", 3000);
+  delay(300);
+
+  if (!sendAT("AT+HTTPINIT", "OK", 5000)) {
+    Serial.println("[HTTP] HTTPINIT falló");
+    return -1;
   }
-  return host.length() > 0;
+  delay(100);
+
+  if (!sendAT("AT+HTTPPARA=\"URL\",\"" + url + "\"", "OK", 5000)) {
+    Serial.println("[HTTP] HTTPPARA URL falló");
+    sendAT("AT+HTTPTERM", "OK", 3000);
+    return -1;
+  }
+
+  // Lanzar GET — el módem responde OK y luego emite el URC +HTTPACTION
+  flushModem();
+  SerialAT.println("AT+HTTPACTION=0");
+
+  String buf = "";
+  uint32_t t0 = millis();
+  while (millis() - t0 < 60000UL) {
+    while (SerialAT.available())
+      buf += (char)SerialAT.read();
+
+    int idx = buf.indexOf("+HTTPACTION:");
+    if (idx != -1) {
+      int eol = buf.indexOf('\n', idx);
+      if (eol != -1) {
+        // Formato: "+HTTPACTION: 0,<code>,<len>"
+        String line = buf.substring(idx, eol);
+        int c1 = line.indexOf(',');
+        int c2 = (c1 != -1) ? line.indexOf(',', c1 + 1) : -1;
+        if (c1 != -1 && c2 != -1) {
+          int code = line.substring(c1 + 1, c2).toInt();
+          int32_t len = line.substring(c2 + 1).toInt();
+          Serial.printf("[HTTP] +HTTPACTION: code=%d len=%d\n", code, len);
+          if (code >= 200 && code < 300)
+            return len;
+          Serial.printf("[HTTP] Error HTTP %d\n", code);
+          sendAT("AT+HTTPTERM", "OK", 3000);
+          return -1;
+        }
+      }
+    }
+
+    // ERROR sin +HTTPACTION → fallo real
+    if (buf.indexOf("ERROR") != -1 && buf.indexOf("+HTTPACTION:") == -1) {
+      Serial.printf("[HTTP] Error en HTTPACTION: %s\n", buf.c_str());
+      sendAT("AT+HTTPTERM", "OK", 3000);
+      return -1;
+    }
+  }
+
+  Serial.println("[HTTP] Timeout esperando +HTTPACTION");
+  sendAT("AT+HTTPTERM", "OK", 3000);
+  return -1;
+}
+
+/*
+  httpReadChunk:
+    Lee 'size' bytes desde 'offset' de la respuesta HTTP ya buffereada.
+    Escribe los bytes en 'buf' (debe tener al menos 'size' bytes).
+    Retorna bytes leídos (0 = fin de datos, -1 = error).
+
+  Comportamiento de lectura binaria:
+    Tras el header "+HTTPREAD: <n>\r\n" llegan exactamente <n> bytes binarios.
+    El timeout se resetea en cada byte recibido (inter-byte timeout = 3 s),
+    lo que elimina el fallo "bloque incompleto" de implementaciones anteriores.
+*/
+int32_t httpReadChunk(int32_t offset, int32_t size, uint8_t *buf) {
+  flushModem();
+  SerialAT.println("AT+HTTPREAD=" + String(offset) + "," + String(size));
+
+  // ── Fase 1: leer la cabecera ASCII "+HTTPREAD: <n>" ──────────
+  String hdr = "";
+  int32_t dataLen = -1;
+  uint32_t t0 = millis();
+
+  while (millis() - t0 < 10000 && dataLen == -1) {
+    while (SerialAT.available() && dataLen == -1) {
+      char c = SerialAT.read();
+      hdr += c;
+
+      if (c == '\n') {
+        if (hdr.indexOf("+HTTPREAD:") != -1) {
+          int idx = hdr.lastIndexOf("+HTTPREAD:");
+          String lenStr = hdr.substring(idx + 10);
+          lenStr.trim();
+          dataLen = lenStr.toInt();
+        } else if (hdr.indexOf("ERROR") != -1) {
+          Serial.printf("[HTTP] Error en HTTPREAD: %s\n", hdr.c_str());
+          return -1;
+        }
+      }
+    }
+  }
+
+  if (dataLen < 0) {
+    Serial.println("[HTTP] Timeout esperando +HTTPREAD header");
+    return -1;
+  }
+  if (dataLen == 0)
+    return 0;
+
+  // ── Fase 2: leer exactamente dataLen bytes binarios ───────────
+  // Timeout inter-byte: si pasan 3 s sin recibir ningún byte → timeout.
+  // A 115200 baud (~11 KB/s) un bloque de 2 KB llega en ~180 ms;
+  // 3 s de margen es más que suficiente para cualquier latencia real.
+  int32_t got = 0;
+  uint32_t tLast = millis();
+  const uint32_t INTER_BYTE_TO = 3000;
+
+  while (got < dataLen && millis() - tLast < INTER_BYTE_TO) {
+    if (SerialAT.available()) {
+      buf[got++] = SerialAT.read();
+      tLast = millis(); // resetear en cada byte recibido
+    }
+  }
+
+  if (got < dataLen) {
+    Serial.printf("[HTTP] Chunk parcial: esperados=%d recibidos=%d\n", dataLen,
+                  got);
+  }
+  return got;
 }
 
 /*
   doOTA:
-    Descarga el firmware desde 'url' (debe ser https://) usando los
-    comandos AT+CHTTPS* del módem A7670G y lo escribe en la partición
-    OTA del ESP32 con la API Update.h.
+    Descarga el firmware desde 'url' (debe ser https://) usando AT+HTTP*
+    y lo escribe en la partición OTA del ESP32 con la API Update.h.
 
-  Flujo AT:
-    1. AT+CHTTPSINIT           → inicia stack HTTPS del módem
-    2. AT+CHTTPSOPSE           → abre conexión TLS al servidor
-    3. AT+CHTTPSHEAD           → envía petición GET
-    4. AT+CHTTPSRECV=0,<n>     → lee bloques de bytes
-       → repetir hasta totalSize
-    5. AT+CHTTPSCLSE=0         → cierra conexión
-    6. AT+CHTTPSNULL           → libera stack HTTPS
+  Flujo:
+    1. httpGetInit(url)          → GET, espera Content-Length
+    2. Update.begin(totalSize)   → prepara la partición OTA
+    3. Loop: httpReadChunk()     → lee en bloques de 2 KB
+             Update.write()     → escribe en flash
+    4. AT+HTTPTERM               → cierra sesión HTTP
+    5. Update.end()              → valida y activa la partición
+    6. ESP.restart()             → aplica el nuevo firmware
 */
 void doOTA(const String &version, const String &url) {
-  Serial.println("\n[OTA] ========== INICIANDO OTA ==========");
-  Serial.printf("[OTA] Actual: %s  Nueva: %s\n", FIRMWARE_VERSION,
-                version.c_str());
-  Serial.printf("[OTA] URL: %s\n", url.c_str());
-
-  if (version == FIRMWARE_VERSION) {
-    publishOtaStatus("{\"info\":\"ya_tengo_esta_version\"}");
-    return;
-  }
-
-  String host, path;
-  if (!parseHttpsUrl(url, host, path)) {
-    publishOtaStatus("{\"error\":\"url_invalida\"}");
-    return;
-  }
-  Serial.printf("[OTA] Host: %s  Path: %s\n", host.c_str(), path.c_str());
+  Serial.println("\n[OTA] ======== INICIANDO DESCARGA OTA ========");
+  Serial.printf("[OTA] URL   : %s\n", url.c_str());
+  Serial.printf("[OTA] Versión objetivo: %s\n", version.c_str());
 
   publishOtaStatus(
       ("{\"status\":\"descargando\",\"target\":\"" + version + "\"}").c_str());
   delay(300);
 
-  // ── 1. Iniciar stack HTTPS ────────────────────────────────────
-  sendAT("AT+CHTTPSINIT", "OK", 5000);
-  delay(300);
-
-  // ── 2. Abrir conexión TLS al servidor (puerto 443) ──────────
-  // AT+CHTTPSOPSE="<host>",<port>,<ssl_type>
-  //   ssl_type: 1 = TLS (sin verificar CA) ; 2 = TLS (verificar CA)
-  //   Usamos 1 para compatibilidad con GitHub/S3 sin cargar certificados.
-  String openCmd = "AT+CHTTPSOPSE=\"" + host + "\",443,1";
-  if (!sendAT(openCmd, "+CHTTPSOPSE: 0", 30000)) {
-    Serial.println("[OTA] Fallo abriendo conexión HTTPS");
-    publishOtaStatus("{\"error\":\"https_open_fail\"}");
-    sendAT("AT+CHTTPSNULL", "OK", 5000);
+  int32_t totalSize = httpGetInit(url);
+  if (totalSize <= 0) {
+    Serial.println("[OTA] Fallo en la petición HTTP al firmware");
+    publishOtaStatus("{\"error\":\"http_fail\"}");
     return;
   }
-  delay(300);
 
-  // ── 3. Enviar petición GET ───────────────────────────────────
-  // AT+CHTTPSHEAD=<index>,<len>  → prompt '>' → enviamos la cabecera HTTP
-  String httpReq = "GET " + path + " HTTP/1.1\r\n";
-  httpReq += "Host: " + host + "\r\n";
-  httpReq += "User-Agent: ESP32-OTA/2.0\r\n";
-  httpReq += "Connection: close\r\n";
-  httpReq += "\r\n";
+  Serial.printf("[OTA] Tamaño del firmware: %d bytes\n", totalSize);
 
-  flushModem();
-  SerialAT.println("AT+CHTTPSHEAD=0," + String(httpReq.length()));
-  if (!waitPromptAndSend((const uint8_t *)httpReq.c_str(), httpReq.length(),
-                         10000)) {
-    Serial.println("[OTA] Fallo enviando cabecera GET");
-    publishOtaStatus("{\"error\":\"https_head_fail\"}");
-    sendAT("AT+CHTTPSCLSE=0", "OK", 5000);
-    sendAT("AT+CHTTPSNULL", "OK", 5000);
+  if (!Update.begin(totalSize)) {
+    Update.printError(Serial);
+    publishOtaStatus("{\"error\":\"no_space\"}");
+    sendAT("AT+HTTPTERM", "OK", 5000);
     return;
   }
-  delay(500);
+  Serial.println("[OTA] Update.begin() OK — descargando...");
 
-  // ── 4. Leer la respuesta HTTP ────────────────────────────────
-  // Primero leemos la cabecera de respuesta para obtener Content-Length
-  // y el código HTTP (200 = OK, 302 = redirect, etc.)
-  // Leer los primeros bytes para encontrar la cabecera
-
-  int32_t totalSize = -1;  // Content-Length
-  bool headerDone = false; // pasamos la línea vacía \r\n\r\n
-  String headerBuf = "";
+  const int32_t CHUNK_SIZE = 1024;
+  static uint8_t chunkBuf[CHUNK_SIZE]; // static → no consume stack
+  int32_t offset = 0;
   int32_t written = 0;
-  bool updateStarted = false;
-  bool otaSuccess = false;
+  bool failed = false;
+  uint32_t tStart = millis();
 
-  // Buffer de lectura en bloques de 512 bytes por AT+CHTTPSRECV
-  const int RECV_BLOCK = 512;
+  while (offset < totalSize && !failed) {
+    int32_t toRead = min((int32_t)CHUNK_SIZE, totalSize - offset);
+    int32_t got = httpReadChunk(offset, toRead, chunkBuf);
 
-  Serial.println("[OTA] Leyendo respuesta HTTP...");
-
-  // Leer en un loop hasta que el servidor cierre la conexión
-  // o hayamos escrito totalSize bytes
-  uint32_t otaTimeout = millis();
-  const uint32_t OTA_MAX_MS = 180000UL; // 3 minutos máximo
-
-  while (millis() - otaTimeout < OTA_MAX_MS) {
-    // Solicitar un bloque al módem
-    flushModem();
-    SerialAT.println("AT+CHTTPSRECV=0," + String(RECV_BLOCK));
-
-    // El módem responde con:
-    //   +CHTTPSRECV: DATA,<len>
-    //   <bytes raw>
-    //   OK
-    // o "+CHTTPSRECV: 0" cuando no hay más datos.
-
-    String recvHeader = "";
-    uint32_t t0 = millis();
-    bool gotData = false;
-
-    while (millis() - t0 < 10000) {
-      while (SerialAT.available()) {
-        char c = SerialAT.read();
-        recvHeader += c;
-
-        // Buscar la cabecera de datos "+CHTTPSRECV: DATA,<len>"
-        if (!gotData && recvHeader.indexOf("+CHTTPSRECV: DATA,") != -1) {
-          // Parsear la longitud
-          int idx = recvHeader.indexOf("+CHTTPSRECV: DATA,");
-          int endIdx = recvHeader.indexOf('\n', idx);
-          if (endIdx == -1)
-            continue;
-          String lenStr = recvHeader.substring(idx + 18, endIdx);
-          lenStr.trim();
-          int dataLen = lenStr.toInt();
-          if (dataLen <= 0)
-            break;
-
-          gotData = true;
-
-          // Leer exactamente dataLen bytes de la UART
-          uint8_t rawBuf[RECV_BLOCK + 32];
-          int received = 0;
-          uint32_t t1 = millis();
-          while (received < dataLen && millis() - t1 < 10000) {
-            if (SerialAT.available()) {
-              rawBuf[received++] = SerialAT.read();
-            }
-          }
-
-          if (!headerDone) {
-            // Acumular en headerBuf para parsear cabecera HTTP
-            for (int i = 0; i < received; i++)
-              headerBuf += (char)rawBuf[i];
-
-            // Buscar fin de cabecera HTTP (\r\n\r\n)
-            int headerEnd = headerBuf.indexOf("\r\n\r\n");
-            if (headerEnd != -1) {
-              headerDone = true;
-
-              // Parsear código HTTP (línea 1: "HTTP/1.1 200 OK")
-              int codeStart = headerBuf.indexOf("HTTP/1.1 ");
-              if (codeStart == -1)
-                codeStart = headerBuf.indexOf("HTTP/1.0 ");
-              int httpCode = 0;
-              if (codeStart != -1) {
-                httpCode =
-                    headerBuf.substring(codeStart + 9, codeStart + 12).toInt();
-              }
-              Serial.printf("[OTA] HTTP Code: %d\n", httpCode);
-
-              if (httpCode == 301 || httpCode == 302) {
-                // GitHub usa 302 para redirigir a la descarga real
-                // Extraer Location header
-                int locIdx = headerBuf.indexOf("Location: ");
-                if (locIdx == -1)
-                  locIdx = headerBuf.indexOf("location: ");
-                if (locIdx != -1) {
-                  int locEnd = headerBuf.indexOf('\n', locIdx);
-                  String location = headerBuf.substring(locIdx + 10, locEnd);
-                  location.trim();
-                  Serial.printf("[OTA] Redirect → %s\n", location.c_str());
-                  // Guardar la nueva URL y reintentar en el loop principal
-                  otaVersion = version;
-                  otaUrl = location;
-                  otaPending = true;
-                }
-                publishOtaStatus(
-                    "{\"error\":\"redirect_no_soportado_directamente\"}");
-                sendAT("AT+CHTTPSCLSE=0", "OK", 5000);
-                sendAT("AT+CHTTPSNULL", "OK", 5000);
-                return;
-              }
-
-              if (httpCode != 200) {
-                Serial.printf("[OTA] HTTP Error %d\n", httpCode);
-                char errBuf[48];
-                snprintf(errBuf, sizeof(errBuf), "{\"error\":\"http_%d\"}",
-                         httpCode);
-                publishOtaStatus(errBuf);
-                sendAT("AT+CHTTPSCLSE=0", "OK", 5000);
-                sendAT("AT+CHTTPSNULL", "OK", 5000);
-                return;
-              }
-
-              // Parsear Content-Length
-              int clIdx = headerBuf.indexOf("Content-Length: ");
-              if (clIdx == -1)
-                clIdx = headerBuf.indexOf("content-length: ");
-              if (clIdx != -1) {
-                int clEnd = headerBuf.indexOf('\n', clIdx);
-                String clStr = headerBuf.substring(clIdx + 16, clEnd);
-                clStr.trim();
-                totalSize = clStr.toInt();
-                Serial.printf("[OTA] Content-Length: %d bytes\n", totalSize);
-              }
-
-              // Iniciar partición OTA
-              if (!Update.begin(totalSize > 0 ? totalSize
-                                              : UPDATE_SIZE_UNKNOWN)) {
-                Update.printError(Serial);
-                publishOtaStatus("{\"error\":\"no_space\"}");
-                sendAT("AT+CHTTPSCLSE=0", "OK", 5000);
-                sendAT("AT+CHTTPSNULL", "OK", 5000);
-                return;
-              }
-              updateStarted = true;
-              Serial.println("[OTA] Update.begin() OK — escribiendo...");
-
-              // Escribir el cuerpo que ya llegó en este bloque
-              int bodyStart = headerEnd + 4;
-              int bodyLen = received - bodyStart;
-              if (bodyLen > 0) {
-                written += Update.write(rawBuf + bodyStart, bodyLen);
-              }
-            }
-            // Si aún no encontramos el fin de cabecera, seguir acumulando
-          } else {
-            // Ya pasamos la cabecera → escribir directamente en flash
-            if (updateStarted && received > 0) {
-              written += Update.write(rawBuf, received);
-              Serial.printf("[OTA] %d / %d bytes (%.0f%%)\r", written,
-                            totalSize,
-                            totalSize > 0 ? (written * 100.0 / totalSize) : 0);
-            }
-          }
-          break; // salir del bucle de lectura de UART
-        }
-
-        // "+CHTTPSRECV: 0" → no hay más datos disponibles aún
-        if (recvHeader.indexOf("+CHTTPSRECV: 0") != -1) {
-          // Verificar si la conexión ya se cerró
-          if (recvHeader.indexOf("+CHTTPSCLSE") != -1 ||
-              (totalSize > 0 && written >= totalSize)) {
-            goto ota_done;
-          }
-          delay(200);
-          break;
-        }
-
-        // "+CHTTPSCLSE" URC → servidor cerró la conexión
-        if (recvHeader.indexOf("+CHTTPSCLSE") != -1) {
-          goto ota_done;
-        }
+    if (got < 0) {
+      Serial.printf("[OTA] Error leyendo chunk en offset=%d\n", offset);
+      failed = true;
+      break;
+    }
+    if (got == 0) {
+      if (offset < totalSize) {
+        Serial.printf("[OTA] Fin prematuro en offset=%d (esperado=%d)\n",
+                      offset, totalSize);
+        failed = true;
       }
-
-      if (gotData)
-        break;
+      break;
     }
 
-    // Verificar si ya descargamos todo
-    if (totalSize > 0 && written >= totalSize)
+    int32_t w = Update.write(chunkBuf, got);
+    if (w != got) {
+      Serial.printf("[OTA] Error flash: write=%d got=%d\n", w, got);
+      failed = true;
       break;
+    }
 
-    delay(50);
+    written += w;
+    offset += got;
+
+    // Progreso cada ~32 KB o al finalizar
+    if ((offset % (CHUNK_SIZE * 16) < CHUNK_SIZE) || offset >= totalSize) {
+      float elapsed = (millis() - tStart) / 1000.0f + 0.001f;
+      Serial.printf("[OTA] %d / %d bytes (%.0f%%) — %.1f KB/s\r", written,
+                    totalSize, written * 100.0f / totalSize,
+                    written / 1024.0f / elapsed);
+    }
   }
 
-ota_done:
   Serial.println();
+  sendAT("AT+HTTPTERM", "OK", 5000);
   Serial.printf("[OTA] Descargados: %d / %d bytes\n", written, totalSize);
 
-  // ── 5. Cerrar conexión ──────────────────────────────────────
-  sendAT("AT+CHTTPSCLSE=0", "OK", 5000);
-  sendAT("AT+CHTTPSNULL", "OK", 5000);
-
-  if (!updateStarted) {
-    publishOtaStatus("{\"error\":\"update_no_iniciado\"}");
+  if (failed) {
+    publishOtaStatus("{\"error\":\"descarga_fallida\"}");
+    Update.abort();
     return;
   }
 
-  // ── 6. Finalizar y reiniciar ────────────────────────────────
   if (Update.end() && Update.isFinished()) {
     char okBuf[64];
     snprintf(okBuf, sizeof(okBuf), "{\"status\":\"ok\",\"version\":\"%s\"}",
@@ -1128,11 +1070,8 @@ ota_done:
     Formato esperado del JSON en el servidor:
       {"version":"2.1","url":"https://example.com/firmware.bin"}
 
-    Seguridad:
-      - La URL del manifiesto DEBE ser https://
-      - La URL del firmware dentro del JSON también debe ser https://
-      - No se requiere token (es el dispositivo quien consulta,
-        no un comando externo)
+    Nota: AT+HTTPREAD devuelve solo el cuerpo (el módem quita los
+    headers HTTP), así que no hay que buscar \r\n\r\n.
 
     Llama esta función desde setup() DESPUÉS de mqttConnect().
 */
@@ -1142,121 +1081,32 @@ void checkOtaOnBoot() {
     return;
   }
 
-  String manifestUrl = String(OTA_VERSION_URL);
-  if (!manifestUrl.startsWith("https://")) {
-    Serial.println("[OTA-BOOT] OTA_VERSION_URL debe ser https:// — omitiendo");
+  Serial.println("[OTA-BOOT] ── Verificando versión de firmware ──");
+  Serial.printf("[OTA-BOOT] Versión actual : %s\n", FIRMWARE_VERSION);
+  Serial.printf("[OTA-BOOT] URL manifiesto : %s\n", OTA_VERSION_URL);
+
+  // ── Descargar manifiesto JSON ─────────────────────────────────
+  int32_t manifestLen = httpGetInit(String(OTA_VERSION_URL));
+  if (manifestLen <= 0) {
+    Serial.println("[OTA-BOOT] No se pudo obtener el manifiesto");
     return;
   }
 
-  Serial.println("[OTA-BOOT] Consultando servidor de versiones...");
-  Serial.printf("[OTA-BOOT] URL: %s\n", manifestUrl.c_str());
+  // Leer el cuerpo (el manifiesto es pequeño — máx 512 bytes)
+  const int32_t MAX_MANIFEST = 512;
+  static uint8_t manifestBuf[MAX_MANIFEST + 1];
+  int32_t got = httpReadChunk(0, min(manifestLen, MAX_MANIFEST), manifestBuf);
+  sendAT("AT+HTTPTERM", "OK", 5000);
 
-  String host, path;
-  if (!parseHttpsUrl(manifestUrl, host, path)) {
-    Serial.println("[OTA-BOOT] URL de manifiesto inválida");
+  if (got <= 0) {
+    Serial.println("[OTA-BOOT] No se pudo leer el manifiesto");
     return;
   }
+  manifestBuf[got] = '\0'; // null-terminate para usarlo como String
 
-  // ── Iniciar stack HTTPS ────────────────────────────────────────
-  sendAT("AT+CHTTPSINIT", "OK", 5000);
-  delay(300);
-
-  String openCmd = "AT+CHTTPSOPSE=\"" + host + "\",443,1";
-  if (!sendAT(openCmd, "+CHTTPSOPSE: 0", 30000)) {
-    Serial.println("[OTA-BOOT] No se pudo conectar al servidor de versiones");
-    sendAT("AT+CHTTPSNULL", "OK", 5000);
-    return;
-  }
-  delay(300);
-
-  // ── Petición GET al manifiesto ─────────────────────────────────
-  String httpReq = "GET " + path + " HTTP/1.1\r\n";
-  httpReq += "Host: " + host + "\r\n";
-  httpReq += "User-Agent: ESP32-OTA/2.0\r\n";
-  httpReq += "Connection: close\r\n";
-  httpReq += "\r\n";
-
-  flushModem();
-  SerialAT.println("AT+CHTTPSHEAD=0," + String(httpReq.length()));
-  if (!waitPromptAndSend((const uint8_t *)httpReq.c_str(), httpReq.length(),
-                         10000)) {
-    Serial.println("[OTA-BOOT] Fallo enviando petición GET");
-    sendAT("AT+CHTTPSCLSE=0", "OK", 5000);
-    sendAT("AT+CHTTPSNULL", "OK", 5000);
-    return;
-  }
-  delay(500);
-
-  // ── Leer respuesta (máx 2 KB — el manifiesto es pequeño) ───────
-  String responseBuf = "";
-  const int MANIFEST_BLOCK = 512;
-  uint32_t t0 = millis();
-  bool done = false;
-
-  while (!done && millis() - t0 < 20000) {
-    flushModem();
-    SerialAT.println("AT+CHTTPSRECV=0," + String(MANIFEST_BLOCK));
-
-    String recvHdr = "";
-    uint32_t t1 = millis();
-    bool gotBlock = false;
-
-    while (millis() - t1 < 8000) {
-      while (SerialAT.available()) {
-        char c = SerialAT.read();
-        recvHdr += c;
-
-        if (!gotBlock && recvHdr.indexOf("+CHTTPSRECV: DATA,") != -1) {
-          int idx = recvHdr.indexOf("+CHTTPSRECV: DATA,");
-          int eol = recvHdr.indexOf('\n', idx);
-          if (eol == -1)
-            continue;
-          int dataLen = recvHdr.substring(idx + 18, eol).toInt();
-          if (dataLen <= 0) {
-            done = true;
-            break;
-          }
-
-          gotBlock = true;
-          uint8_t tmp[MANIFEST_BLOCK + 32];
-          int rx = 0;
-          uint32_t t2 = millis();
-          while (rx < dataLen && millis() - t2 < 8000) {
-            if (SerialAT.available())
-              tmp[rx++] = SerialAT.read();
-          }
-          responseBuf += String((char *)tmp).substring(0, rx);
-
-          // Dejar de leer si ya tenemos suficiente (2 KB máx)
-          if (responseBuf.length() >= 2048)
-            done = true;
-          break;
-        }
-
-        if (recvHdr.indexOf("+CHTTPSRECV: 0") != -1 ||
-            recvHdr.indexOf("+CHTTPSCLSE") != -1) {
-          done = true;
-          break;
-        }
-      }
-      if (gotBlock || done)
-        break;
-    }
-    if (!gotBlock)
-      done = true;
-    delay(50);
-  }
-
-  sendAT("AT+CHTTPSCLSE=0", "OK", 5000);
-  sendAT("AT+CHTTPSNULL", "OK", 5000);
-
-  // ── Extraer cuerpo JSON (tras \r\n\r\n) ────────────────────────
-  int bodyStart = responseBuf.indexOf("\r\n\r\n");
-  String jsonBody =
-      (bodyStart != -1) ? responseBuf.substring(bodyStart + 4) : responseBuf;
+  String jsonBody = String((char *)manifestBuf);
   jsonBody.trim();
-
-  Serial.printf("[OTA-BOOT] Respuesta del servidor: %s\n", jsonBody.c_str());
+  Serial.printf("[OTA-BOOT] Manifiesto: %s\n", jsonBody.c_str());
 
   // ── Parsear version y url del JSON ────────────────────────────
   auto extractField = [](const String &json, const String &key) -> String {
@@ -1279,11 +1129,10 @@ void checkOtaOnBoot() {
     return;
   }
 
-  Serial.printf("[OTA-BOOT] Versión local: %s  —  Versión remota: %s\n",
-                FIRMWARE_VERSION, remoteVersion.c_str());
+  Serial.printf("[OTA-BOOT] Versión remota : %s\n", remoteVersion.c_str());
 
   if (remoteVersion == FIRMWARE_VERSION) {
-    Serial.println("[OTA-BOOT] Firmware actualizado. No hay nada que hacer.");
+    Serial.println("[OTA-BOOT] Firmware al día — sin actualización.");
     return;
   }
 
@@ -1292,11 +1141,10 @@ void checkOtaOnBoot() {
     return;
   }
 
-  Serial.printf(
-      "[OTA-BOOT] *** Nueva versión disponible: %s → actualizando ***\n",
-      remoteVersion.c_str());
+  Serial.printf("[OTA-BOOT] *** Nueva versión disponible: %s → %s ***\n",
+                FIRMWARE_VERSION, remoteVersion.c_str());
+  Serial.println("[OTA-BOOT] Iniciando actualización OTA...");
 
-  // Publicar estado si MQTT está conectado
   if (mqttConnected) {
     String statusMsg = "{\"status\":\"auto_ota_inicio\",\"desde\":\"" +
                        String(FIRMWARE_VERSION) + "\",\"hacia\":\"" +
