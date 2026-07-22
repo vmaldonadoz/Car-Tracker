@@ -42,7 +42,7 @@
 #include <Update.h>
 
 // ─── Versión de firmware ────────────────────────────────────────
-#define FIRMWARE_VERSION "2.2"
+#define FIRMWARE_VERSION "2.3"
 
 // ─── OTA automático al arrancar ─────────────────────────────────
 // URL de un JSON estático con la versión disponible. Formato:
@@ -53,7 +53,7 @@
   "version.json"
 
 // ─── Identificación del dispositivo ────────────────────────────
-#define DEVICE_ID 4
+#define DEVICE_ID 1
 
 // ─── SIM y APN ─────────────────────────────────────────────────
 #define SIM_PIN ""  // dejar vacío si la SIM no tiene PIN
