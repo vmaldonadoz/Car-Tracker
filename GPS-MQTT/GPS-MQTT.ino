@@ -42,7 +42,7 @@
 #include <Update.h>
 
 // ─── Versión de firmware ────────────────────────────────────────
-#define FIRMWARE_VERSION "2.3"
+#define FIRMWARE_VERSION "2.4"
 
 // ─── OTA automático al arrancar ─────────────────────────────────
 // URL de un JSON estático con la versión disponible. Formato:
@@ -1864,7 +1864,6 @@ void loop() {
         flushOfflineQueue();  // enviar lo acumulado al reconectar
       }
     }
-    return;  // no publicar hasta tener conexión
   }
 
   // ── Reintentar verificación OTA si falló por falta de red ───────
