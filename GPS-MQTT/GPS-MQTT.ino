@@ -42,7 +42,7 @@
 #include <Update.h>
 
 // ─── Versión de firmware ────────────────────────────────────────
-#define FIRMWARE_VERSION "2.6"
+#define FIRMWARE_VERSION "2.7"
 
 // ─── OTA automático al arrancar ─────────────────────────────────
 // URL de un JSON estático con la versión disponible. Formato:
