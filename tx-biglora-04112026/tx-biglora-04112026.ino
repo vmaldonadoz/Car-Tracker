@@ -46,7 +46,7 @@
 // ─── Identificación del dispositivo ─────────────────────────
 // CAMBIAR este valor para cada transmisor (1, 2, 3, ...)
 // Se puede sobrescribir en NVS con saveDeviceId(N) en setup()
-#define DEVICE_ID_DEFAULT 101
+#define DEVICE_ID_DEFAULT 100
 
 // ─── Parámetros GPS ──────────────────────────────────────────
 #define HDOP_MAX         3.0f
@@ -227,7 +227,7 @@ bool loraApplyConfig() {
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
   if (!LoRa.begin(LORA_FREQ)) return false;
-  LoRa.setSpreadingFactor(9);
+  LoRa.setSpreadingFactor(8);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(6);
   LoRa.setTxPower(20);

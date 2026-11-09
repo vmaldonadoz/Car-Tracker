@@ -545,7 +545,7 @@ void initLoRa() {
   if (!LoRa.begin(LORA_FREQ)) {
     Serial.println("[LoRa] ERROR"); while (1) delay(1000);
   }
-  LoRa.setSpreadingFactor(9);
+  LoRa.setSpreadingFactor(8);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(6);
   LoRa.enableCrc();

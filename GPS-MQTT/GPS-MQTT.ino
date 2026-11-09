@@ -42,7 +42,7 @@
 #include <Update.h>
 
 // ─── Versión de firmware ────────────────────────────────────────
-#define FIRMWARE_VERSION "2.8"
+#define FIRMWARE_VERSION "2.9"
 
 // ─── OTA automático al arrancar ─────────────────────────────────
 // URL de un JSON estático con la versión disponible. Formato:
@@ -74,7 +74,7 @@ uint16_t deviceId = 0; // ← rellenado por loadDeviceId() en setup()
 // VALOR NORMAL (producción):  0  ← no sobreescribe la NVS
 // MIGRACIÓN dispositivo 1  :  1  ← fuerza ID=1 en NVS
 // MIGRACIÓN dispositivo 2  :  2  ← fuerza ID=2 en NVS
-#define DEVICE_ID_MIGRATION 1
+#define DEVICE_ID_MIGRATION 0
 
 // ─── SIM y APN ─────────────────────────────────────────────────
 #define SIM_PIN "" // dejar vacío si la SIM no tiene PIN
