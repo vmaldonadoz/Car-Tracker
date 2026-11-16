@@ -38,7 +38,7 @@
 #include <XPowersLib.h>
 
 // ─── Versión de firmware ─────────────────────────────────────
-#define FIRMWARE_VERSION "2.1"
+#define FIRMWARE_VERSION "1.8"
 
 // ─── Seguridad MQTT/OTA ──────────────────────────────────────
 // 0 = TCP plano (más simple), 1 = TLS (cifrado, necesita broker TLS)
@@ -545,7 +545,7 @@ void initLoRa() {
   if (!LoRa.begin(LORA_FREQ)) {
     Serial.println("[LoRa] ERROR"); while (1) delay(1000);
   }
-  LoRa.setSpreadingFactor(8);
+  LoRa.setSpreadingFactor(7);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(6);
   LoRa.enableCrc();
